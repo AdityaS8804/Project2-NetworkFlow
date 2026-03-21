@@ -6,6 +6,9 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import streamlit as st
+import numpy as np
+from collections import Counter
+
 from app.config import WATCH_DIR, REFRESH_INTERVAL_SEC, ID_TO_ATTACK
 from app.state import AppState
 from app.pipeline import BackgroundPipeline
@@ -13,7 +16,9 @@ from app.watcher import PcapWatcher
 from app.nl_query import NLQueryEngine
 from app.visualizations import (
     build_embedding_scatter, build_attack_timeline, build_attack_pie,
-    build_topology_graph, build_similarity_bars,
+    build_topology_graph, build_similarity_bars, ATTACK_COLORS,
+    build_gt_pie, build_gt_timeline, build_graph_stats_scatter,
+    build_embedding_scatter_gt,
 )
 
 DEMO_CSV_OPTIONS = {
@@ -31,6 +36,15 @@ DEMO_CSV_OPTIONS = {
         "datasets/csv/Monday-WorkingHours.pcap_ISCX.csv", 0),
 }
 
+NL_QUERY_EXAMPLES = [
+    "Brute force authentication attempts with repeated login connections",
+    "Denial of Service attack with high degree centrality and flooding",
+    "Normal benign traffic with standard communication patterns",
+    "Distributed attack from multiple sources with coordinated botnet activity",
+    "Web application attack with malicious HTTP request patterns",
+    "Concentrated traffic targeting a single host",
+]
+
 
 @st.cache_resource
 def init_backend():
@@ -45,7 +59,7 @@ def init_backend():
         pipeline=pipeline,
     )
     watcher.start()
-    watcher.pause()  # start paused — user picks a mode first
+    watcher.pause()
 
     nl_engine = NLQueryEngine(pipeline.inference, state)
     return state, pipeline, watcher, nl_engine
@@ -65,18 +79,16 @@ def _switch_mode(state, pipeline, watcher, new_mode):
 
 def main():
     st.set_page_config(
-        page_title="GNN Network Monitor",
-        page_icon="🔍",
+        page_title="GNN-BERT Network Analyzer",
+        page_icon="🔬",
         layout="wide",
     )
 
     state, pipeline, watcher, nl_engine = init_backend()
 
     # ── Sidebar ──────────────────────────────────────────────
-    st.sidebar.title("Network Monitor")
+    st.sidebar.title("GNN-BERT Network Analyzer")
 
-    # Mode selector — use a separate key to track the *applied* mode,
-    # because Streamlit updates the widget's session_state key before rerun.
     mode = st.sidebar.selectbox("Mode", ["Demo", "Live"], key="app_mode")
     applied_mode = st.session_state.get("_applied_mode")
 
@@ -95,7 +107,6 @@ def main():
             for e in errors[-5:]:
                 st.text(e)
 
-    # ── Mode-specific sidebar controls ───────────────────────
     st.sidebar.markdown("---")
 
     if mode == "Demo":
@@ -103,19 +114,23 @@ def main():
     else:
         _render_live_controls(st.sidebar)
 
-    # ── Navigation ───────────────────────────────────────────
     st.sidebar.markdown("---")
-    page = st.sidebar.radio("Navigation", ["Dashboard", "NL Query", "Topology"])
+    page = st.sidebar.radio(
+        "Navigation",
+        ["Embedding Explorer", "NL Query", "Graph Inspector", "Architecture"],
+    )
     auto_refresh = st.sidebar.checkbox("Auto-refresh", value=(mode == "Live"))
 
-    if page == "Dashboard":
-        render_dashboard(state, mode)
+    if page == "Embedding Explorer":
+        render_embedding_page(state, mode)
     elif page == "NL Query":
         render_query_page(nl_engine, state, mode)
-    elif page == "Topology":
+    elif page == "Graph Inspector":
         render_topology_page(state)
+    elif page == "Architecture":
+        render_architecture_page()
 
-    if auto_refresh and page == "Dashboard":
+    if auto_refresh and page == "Embedding Explorer":
         time.sleep(REFRESH_INTERVAL_SEC)
         st.rerun()
 
@@ -144,8 +159,8 @@ def _render_demo_controls(sb, state, pipeline):
         st.rerun()
 
     sb.caption(
-        "Demo mode loads pre-recorded CIC-IDS2017 network traffic "
-        "(the same data the model was trained on) for accurate classification."
+        "Loads pre-recorded CIC-IDS2017 network traffic into the "
+        "GNN encoder and cross-attention bridge for analysis."
     )
 
 
@@ -155,46 +170,47 @@ def _render_live_controls(sb):
         f"Watching **`{WATCH_DIR}`** for new files.\n\n"
         "Drop `.pcapng`, `.pcap`, or CICFlowMeter `.csv` files into that directory."
     )
-    sb.caption(
-        "Live mode processes new captures in real-time. "
-        "PCAP files are analysed via cicflowmeter. "
-        "For best accuracy, use CICFlowMeter-format CSVs."
+
+
+# ── Page: Embedding Explorer ─────────────────────────────────
+
+def render_embedding_page(state, mode):
+    st.title("Embedding Space Explorer")
+    st.markdown(
+        "Visualize how the **GNN encoder** maps network traffic graphs into a "
+        "128-dimensional embedding space. Each point is a 30-second traffic window "
+        "represented as an IP-flow graph."
     )
-
-
-# ── Page renderers ───────────────────────────────────────────
-
-def render_dashboard(state, mode):
-    st.title("Live Network Monitoring Dashboard")
 
     records = state.get_records()
     if not records:
         if mode == "Demo":
             st.info("No data loaded yet. Use the sidebar to select and load a CIC-IDS2017 dataset.")
         else:
-            st.info(
-                "Waiting for network captures. "
-                f"Drop `.pcapng` or `.csv` files into `{WATCH_DIR}`."
-            )
+            st.info(f"Waiting for network captures. Drop files into `{WATCH_DIR}`.")
         return
 
-    # Metrics row
+    # ── Summary metrics ────────────────────────────────────
+    gt_counts = Counter(r.ground_truth_label for r in records)
+
     col1, col2, col3, col4 = st.columns(4)
-    attack_counts = {}
-    for r in records:
-        name = ID_TO_ATTACK.get(r.attack_pred, "Unknown")
-        attack_counts[name] = attack_counts.get(name, 0) + 1
+    col1.metric("Total Graph Snapshots", len(records))
+    col2.metric("Unique Traffic Types",
+                len([k for k in gt_counts if k != "Benign" and k != "Unknown"]))
+    col3.metric("Avg Nodes / Graph",
+                f"{np.mean([r.metadata.get('num_nodes', 0) for r in records]):.0f}")
+    col4.metric("Avg Edges / Graph",
+                f"{np.mean([r.metadata.get('num_edges', 0) for r in records]):.0f}")
 
-    col1.metric("Total Graphs", len(records))
-    benign_count = attack_counts.get("Benign", 0)
-    attack_total = len(records) - benign_count
-    col2.metric("Attack Graphs", attack_total)
-    col3.metric("Benign Graphs", benign_count)
-    col4.metric("Unique Attack Types", len([k for k in attack_counts if k != "Benign"]))
+    # ── Embedding visualization ─────────────────────────────
+    st.subheader("Graph Embedding Space (Stage 1 GNN)")
+    st.caption(
+        "Each point is a traffic graph encoded by the 3-layer GATv2Conv network. "
+        "Colors show CIC-IDS2017 ground truth labels. Clustering indicates the GNN "
+        "learns structurally distinct representations for different traffic types."
+    )
 
-    # Embedding visualization
-    st.subheader("Embedding Space")
-    viz_method = st.radio("Method", ["PCA (fast)", "t-SNE (slow)"], horizontal=True)
+    viz_method = st.radio("Projection", ["PCA (fast)", "t-SNE (detailed)"], horizontal=True)
 
     if viz_method == "PCA (fast)":
         coords = state.get_pca_coords()
@@ -204,24 +220,39 @@ def render_dashboard(state, mode):
             coords = state.get_tsne_coords()
         method_name = "t-SNE"
 
-    col_left, col_right = st.columns([2, 1])
-    with col_left:
-        fig_scatter = build_embedding_scatter(records, coords, method_name)
+    col_scatter, col_dist = st.columns([2, 1])
+    with col_scatter:
+        fig_scatter = build_embedding_scatter_gt(records, coords, method_name)
         st.plotly_chart(fig_scatter, use_container_width=True)
 
-    with col_right:
-        fig_pie = build_attack_pie(records)
+    with col_dist:
+        fig_pie = build_gt_pie(records)
         st.plotly_chart(fig_pie, use_container_width=True)
 
-    # Timeline
-    fig_timeline = build_attack_timeline(records)
+    # ── Graph structure scatter ─────────────────────────────
+    st.subheader("Graph Structure Analysis")
+    st.caption(
+        "Structural properties of each traffic window graph. Attack traffic often creates "
+        "distinct graph signatures — higher density, different degree distributions."
+    )
+    fig_struct = build_graph_stats_scatter(records)
+    st.plotly_chart(fig_struct, use_container_width=True)
+
+    # ── Traffic type timeline ───────────────────────────────
+    st.subheader("Traffic Composition Over Time")
+    fig_timeline = build_gt_timeline(records)
     st.plotly_chart(fig_timeline, use_container_width=True)
 
 
+# ── Page: NL Query ────────────────────────────────────────────
+
 def render_query_page(nl_engine, state, mode):
-    st.title("Natural Language Query")
-    st.markdown("Query the network using natural language. The system finds the most similar "
-                "graph snapshots using the cross-attention embedding space.")
+    st.title("Natural Language Retrieval")
+    st.markdown(
+        "Query the network using natural language. The **Stage 2 cross-attention bridge** "
+        "maps both text and graph embeddings into a shared 256-dim space, enabling "
+        "semantic search over traffic snapshots."
+    )
 
     records = state.get_records()
     if not records:
@@ -231,76 +262,93 @@ def render_query_page(nl_engine, state, mode):
             st.info("No graphs available yet. Waiting for captures.")
         return
 
-    # Example queries
-    st.markdown("**Example queries:**")
-    example_cols = st.columns(3)
-    examples = [
-        "Denial of Service attack with flooding behavior",
-        "Normal benign traffic patterns",
-        "Port scanning activity probing hosts",
-    ]
-    for col, example in zip(example_cols, examples):
-        if col.button(example, use_container_width=True):
+    # ── Example query buttons ──────────────────────────────
+    st.markdown("**Try these queries:**")
+    cols = st.columns(3)
+    for i, example in enumerate(NL_QUERY_EXAMPLES):
+        if cols[i % 3].button(example, use_container_width=True, key=f"ex_{i}"):
             st.session_state['nl_query'] = example
 
-    query = st.text_input("Ask about network activity:",
-                          value=st.session_state.get('nl_query', ''),
-                          key='query_input')
-    top_k = st.slider("Top-K results", 1, 10, 5)
+    query = st.text_input(
+        "Describe the network activity you're looking for:",
+        value=st.session_state.get('nl_query', ''),
+        key='query_input',
+    )
+    top_k = st.slider("Number of results", 3, 15, 5)
 
     if query:
-        with st.spinner("Searching embedding space..."):
+        with st.spinner("Searching cross-attention embedding space..."):
             results, summary = nl_engine.query_with_summary(query, top_k=top_k)
 
-        # Summary
-        st.markdown("### Summary")
+        # ── Summary ────────────────────────────────────────
+        st.markdown("### Retrieval Results")
         st.info(summary)
 
-        # Results
-        st.markdown("### Top Matches")
-
-        # Similarity bar chart
+        # ── Similarity chart ───────────────────────────────
         fig_bars = build_similarity_bars(results)
         st.plotly_chart(fig_bars, use_container_width=True)
 
-        # Detail cards
+        # ── Detail cards ───────────────────────────────────
         for i, r in enumerate(results):
+            rec = r['record']
+            stats = r['stats']
+            gt = rec.ground_truth_label
+            n = stats['num_nodes']
+            e = stats['num_edges']
+
             with st.expander(
-                f"#{i+1} — {r['stats']['attack_name']} "
-                f"(sim={r['similarity']:.3f}, {r['stats']['num_nodes']}n/{r['stats']['num_edges']}e)",
-                expanded=(i == 0)
+                f"#{i+1}  sim={r['similarity']:.3f}  |  "
+                f"GT: {gt}  |  {n} nodes, {e} edges  |  "
+                f"density={stats['density']:.4f}",
+                expanded=(i == 0),
             ):
-                st.markdown(f"**Description:** {r['description']}")
-                st.markdown(f"**Ground Truth:** {r['record'].ground_truth_label}")
-                st.markdown(f"**Window:** {r['stats']['window_start']}")
+                col_desc, col_topo = st.columns([1, 1])
 
-                col1, col2 = st.columns([1, 1])
-                with col1:
-                    st.markdown("**Attack Probabilities:**")
-                    for cls_id in range(7):
-                        prob = r['record'].attack_probs[cls_id]
-                        if prob > 0.01:
-                            st.markdown(f"- {ID_TO_ATTACK.get(cls_id, '?')}: {prob:.1%}")
+                with col_desc:
+                    st.markdown(f"**Matched Description:**")
+                    st.markdown(f"> {r['description']}")
+                    st.markdown(f"**Ground Truth Label:** `{gt}`")
+                    st.markdown(f"**Window:** {stats['window_start']}")
+                    st.markdown(f"**Flows:** {stats['num_flows']}")
 
-                with col2:
+                    st.markdown("**Graph Properties:**")
+                    props = {
+                        "Nodes": n,
+                        "Edges": e,
+                        "Density": f"{stats['density']:.4f}",
+                        "Max Degree": stats['max_degree'],
+                        "Avg Degree": f"{stats['avg_degree']:.1f}",
+                        "Components": stats['num_components'],
+                    }
+                    for k, v in props.items():
+                        st.markdown(f"- **{k}:** {v}")
+
+                with col_topo:
                     fig_topo = build_topology_graph(
-                        r['record'].nx_graph,
-                        title=f"Topology #{i+1}"
+                        rec.nx_graph,
+                        title=f"Topology #{i+1}",
                     )
                     st.plotly_chart(fig_topo, use_container_width=True)
 
 
+# ── Page: Graph Inspector ─────────────────────────────────────
+
 def render_topology_page(state):
-    st.title("Network Topology Explorer")
+    st.title("Graph Inspector")
+    st.markdown(
+        "Explore individual traffic graph snapshots. Each graph represents a 30-second "
+        "window where IP addresses are nodes and network flows are edges, with 77 "
+        "CICFlowMeter features per edge."
+    )
 
     records = state.get_records()
     if not records:
         st.info("No graphs available yet.")
         return
 
-    # Selector
+    # ── Graph selector ─────────────────────────────────────
     options = {
-        f"Graph {i+1} — {ID_TO_ATTACK.get(r.attack_pred, '?')} "
+        f"Window {i+1} — GT: {r.ground_truth_label} "
         f"({r.metadata.get('num_nodes', '?')}n, {r.metadata.get('num_edges', '?')}e) "
         f"@ {r.metadata.get('window_start_ts', '')}": i
         for i, r in enumerate(records)
@@ -309,20 +357,25 @@ def render_topology_page(state):
     selected = st.selectbox("Select a graph snapshot:", list(options.keys()))
     idx = options[selected]
     record = records[idx]
+    G = record.nx_graph
 
-    # Info
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Nodes", record.metadata.get('num_nodes', '?'))
-    col2.metric("Edges", record.metadata.get('num_edges', '?'))
-    col3.metric("Predicted Attack", ID_TO_ATTACK.get(record.attack_pred, '?'))
+    # ── Metrics ────────────────────────────────────────────
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Nodes (IPs)", record.metadata.get('num_nodes', '?'))
+    col2.metric("Edges (Flows)", record.metadata.get('num_edges', '?'))
+    col3.metric("Ground Truth", record.ground_truth_label)
+    col4.metric("Flows in Window", record.metadata.get('num_flows', '?'))
 
-    # Topology graph
-    fig = build_topology_graph(record.nx_graph, title="Network Topology")
+    # ── Topology visualization ─────────────────────────────
+    st.subheader("Network Topology")
+    fig = build_topology_graph(G, title="IP Communication Graph")
     st.plotly_chart(fig, use_container_width=True)
 
-    # Node details
-    with st.expander("Node Details"):
-        G = record.nx_graph
+    # ── Node breakdown ─────────────────────────────────────
+    col_nodes, col_stats = st.columns([1, 1])
+
+    with col_nodes:
+        st.subheader("Node Details")
         node_data = []
         for n in G.nodes():
             node_data.append({
@@ -330,25 +383,129 @@ def render_topology_page(state):
                 'Label': G.nodes[n].get('label', 'Unknown'),
                 'In-Degree': G.in_degree(n),
                 'Out-Degree': G.out_degree(n),
+                'Total Degree': G.degree(n),
             })
-        st.dataframe(node_data, use_container_width=True)
+        st.dataframe(node_data, use_container_width=True, height=300)
 
-    # Attack probability distribution
-    st.subheader("Attack Probability Distribution")
-    import plotly.graph_objects as go
-    from app.visualizations import ATTACK_COLORS
-    probs = record.attack_probs
-    fig_probs = go.Figure(go.Bar(
-        x=[ID_TO_ATTACK.get(i, f"Class {i}") for i in range(len(probs))],
-        y=probs,
-        marker_color=[ATTACK_COLORS.get(i, '#95a5a6') for i in range(len(probs))],
-    ))
-    fig_probs.update_layout(
-        title="Attack Class Probabilities",
-        yaxis_title="Probability",
-        height=300,
+    with col_stats:
+        st.subheader("Graph Statistics")
+        import networkx as nx
+        density = nx.density(G)
+        degrees = [d for _, d in G.degree()]
+        clustering = nx.average_clustering(G.to_undirected()) if G.number_of_nodes() > 1 else 0
+        n_comp = nx.number_weakly_connected_components(G)
+
+        stats_data = {
+            "Density": f"{density:.4f}",
+            "Avg Degree": f"{np.mean(degrees):.2f}" if degrees else "0",
+            "Max Degree": max(degrees) if degrees else 0,
+            "Min Degree": min(degrees) if degrees else 0,
+            "Clustering Coefficient": f"{clustering:.4f}",
+            "Weakly Connected Components": n_comp,
+            "Diameter (largest comp)": "—",
+        }
+
+        try:
+            if n_comp == 1 and G.number_of_nodes() > 1:
+                stats_data["Diameter (largest comp)"] = nx.diameter(G.to_undirected())
+        except Exception:
+            pass
+
+        for k, v in stats_data.items():
+            st.markdown(f"**{k}:** {v}")
+
+        # Node label distribution within this graph
+        node_labels = [G.nodes[n].get('label', 'Unknown') for n in G.nodes()]
+        label_counts = Counter(node_labels)
+        st.markdown("**Node Label Distribution:**")
+        for lbl, cnt in label_counts.most_common():
+            st.markdown(f"- {lbl}: {cnt}")
+
+
+# ── Page: Architecture ────────────────────────────────────────
+
+def render_architecture_page():
+    st.title("Model Architecture")
+    st.markdown(
+        "This system uses a **two-stage architecture** for network traffic analysis, "
+        "combining a Graph Neural Network with a cross-attention bridge to a BERT "
+        "language model."
     )
-    st.plotly_chart(fig_probs, use_container_width=True)
+
+    st.subheader("Stage 1: GNN Encoder")
+    st.markdown("""
+**Model:** 3-layer GATv2Conv (Graph Attention Network v2)
+
+**Input:** IP-flow graphs where:
+- **Nodes** = IP addresses
+- **Edges** = network flows (one per directed IP pair per window)
+- **Features** = 77 CICFlowMeter features per edge (packet counts, byte lengths, IATs, flags, etc.)
+- Node features are computed as the mean of outgoing edge features, then StandardScaler-normalized
+
+**Architecture:**
+```
+Input [N, 77] → GATv2Conv(77→128, 4 heads) → ELU
+             → GATv2Conv(512→128, 4 heads) → ELU
+             → GATv2Conv(512→128, 1 head)
+             → Node embeddings [N, 128]
+             → Global Mean Pool → Graph embedding [128]
+```
+
+**Training:** Trained on 2,934 graph snapshots from CIC-IDS2017 (30-second sliding windows)
+with 7 attack classes. Balanced via oversampling with cross-entropy loss.
+    """)
+
+    st.subheader("Stage 2: Cross-Attention Bridge")
+    st.markdown("""
+**Purpose:** Align graph embeddings with text embeddings in a shared 256-dim space
+for natural language retrieval over network traffic.
+
+**Components:**
+- **GNN Encoder** (frozen from Stage 1) → 128-dim graph representations
+- **BERT** (`bert-base-uncased`, frozen) → 768-dim text representations
+- **Graph Projection:** Linear(128→256) + GELU + LayerNorm + Linear(256→256)
+- **Text Projection:** Linear(768→256) + GELU + LayerNorm + Linear(256→256)
+- **SigLIP contrastive loss** with learnable temperature
+
+**Training:** 50 epochs on ~16K graph-text pairs (template-generated descriptions),
+with cosine-annealing LR schedule and gradient accumulation.
+
+**Output:** L2-normalized 256-dim embeddings enabling cosine-similarity search
+between arbitrary text queries and network traffic graph snapshots.
+    """)
+
+    st.subheader("Graph Construction Pipeline")
+    st.markdown("""
+```
+Raw PCAP / CIC-IDS2017 CSV
+    ↓
+CICFlowMeter (77 features per flow)
+    ↓
+Sliding windows (30s window, 10s stride)
+    ↓
+Directed graph (nx.DiGraph): IPs → nodes, flows → edges
+    ↓
+Node features: mean(outgoing edge features) → StandardScaler
+    ↓
+PyG Data: x=[N,77], edge_index=[2,E]
+    ↓
+Stage 1 GNN → 128-dim embedding (graph-level)
+Stage 2 Bridge → 256-dim shared space embedding
+```
+    """)
+
+    st.subheader("CIC-IDS2017 Dataset")
+    st.markdown("""
+| Attack Class | Label ID | Examples |
+|---|---|---|
+| Benign | 0 | Normal HTTP/HTTPS browsing |
+| DoS | 1 | Hulk, GoldenEye, Slowloris, Slowhttptest |
+| DDoS | 2 | LOIT (Low Orbit Ion Cannon variant) |
+| PortScan | 3 | Nmap-style TCP SYN scanning |
+| BruteForce | 4 | FTP-Patator, SSH-Patator |
+| WebAttack | 5 | SQL injection, XSS, brute force login |
+| Bot/Other | 6 | Ares botnet, Infiltration, Heartbleed |
+    """)
 
 
 if __name__ == "__main__":

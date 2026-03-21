@@ -127,6 +127,7 @@ def _convert_to_ethernet_pcap(pcap_path, output_dir):
     for pkt in packets:
         if pkt.haslayer(IP):
             eth_pkt = Ether(dst='ff:ff:ff:ff:ff:ff', src='00:00:00:00:00:00') / pkt[IP]
+            eth_pkt.time = pkt.time  # Preserve original pcap timestamp
             eth_packets.append(eth_pkt)
         elif pkt.haslayer(Ether):
             eth_packets.append(pkt)

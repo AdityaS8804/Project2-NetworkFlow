@@ -3,7 +3,17 @@ import numpy as np
 import networkx as nx
 from collections import Counter
 
-from .config import ID_TO_ATTACK
+from .config import ID_TO_ATTACK, ATTACK_LABEL_MAP
+
+
+def _normalize_gt(label):
+    """Normalize ground truth label to display name."""
+    if label in ('Benign', 'Unknown'):
+        return label
+    cls_id = ATTACK_LABEL_MAP.get(label, -1)
+    if cls_id >= 0:
+        return ID_TO_ATTACK.get(cls_id, label)
+    return label
 
 
 def extract_graph_statistics(record):
@@ -21,9 +31,7 @@ def extract_graph_statistics(record):
         'density': nx.density(G) if num_nodes > 1 else 0,
         'max_degree': max(degrees) if degrees else 0,
         'num_components': nx.number_weakly_connected_components(G) if num_nodes > 0 else 0,
-        'attack_label': record.attack_pred,
-        'attack_name': ID_TO_ATTACK.get(record.attack_pred, "Unknown"),
-        'confidence': float(record.attack_probs[record.attack_pred]) if record.attack_probs is not None else 0.0,
+        'gt_label': _normalize_gt(record.ground_truth_label),
         'window_start': record.metadata.get('window_start_ts', ''),
         'num_flows': record.metadata.get('num_flows', 0),
     }
@@ -31,48 +39,47 @@ def extract_graph_statistics(record):
 
 
 def generate_template_description(stats):
-    """Generate NL description from graph stats using attack-specific templates."""
-    attack_type = stats['attack_name']
+    """Generate NL description from graph stats using templates."""
+    gt = stats['gt_label']
     n, e = stats['num_nodes'], stats['num_edges']
     ad, d = stats['avg_degree'], stats['density']
     nc, md = stats['num_components'], stats['max_degree']
-    conf = stats['confidence']
 
     templates = {
         "Benign": [
-            f"Normal network traffic with {n} nodes and {e} connections. The network shows typical communication patterns with average degree {ad:.1f}. Confidence: {conf:.0%}.",
-            f"Benign traffic pattern involving {n} network entities. Graph density is {d:.3f}, indicating normal connectivity.",
-            f"Regular network activity with {n} hosts exchanging {e} packets. Network topology shows {nc} component(s) with standard structure.",
+            f"Normal network traffic with {n} nodes and {e} connections. Average degree {ad:.1f}, density {d:.3f}.",
+            f"Benign traffic pattern involving {n} network entities in {nc} component(s).",
+            f"Regular network activity with {n} hosts. Network density {d:.3f}, max degree {md}.",
         ],
         "DoS": [
-            f"Denial of Service attack detected with {n} nodes and {e} connections. Unusually high degree centrality (avg {ad:.1f}) indicates flooding behavior. Confidence: {conf:.0%}.",
-            f"DoS attack pattern: {n} network nodes with concentrated traffic. Maximum degree of {md} suggests targeted flooding.",
-            f"Network under DoS attack with {e} malicious connections. Topology shows {nc} component(s) with attack concentration.",
+            f"Denial of Service traffic window with {n} nodes and {e} connections. Average degree {ad:.1f} indicates concentrated traffic.",
+            f"DoS traffic pattern: {n} network nodes, max degree {md} suggests targeted flooding.",
+            f"Network with DoS activity — {e} connections across {nc} component(s).",
         ],
         "DDoS": [
-            f"Distributed Denial of Service attack involving {n} nodes. High edge count ({e}) and density ({d:.3f}) indicate coordinated botnet activity. Confidence: {conf:.0%}.",
-            f"DDoS attack with distributed sources: {n} participating nodes. Network shows {nc} component(s), suggesting multiple attack vectors.",
+            f"Distributed Denial of Service traffic involving {n} nodes. Density {d:.3f} with {e} connections.",
+            f"DDoS activity: {n} participating nodes in {nc} component(s) with {e} connections.",
         ],
         "PortScan": [
-            f"Port scanning activity detected across {n} network nodes. High connectivity ({e} edges) from scanning probes. Confidence: {conf:.0%}.",
-            f"Network reconnaissance via port scan: {n} targets with {e} probe attempts. Topology reveals {nc} scanning pattern(s).",
+            f"Port scanning traffic across {n} network nodes with {e} connection probes.",
+            f"Network reconnaissance: {n} targets with {e} probe edges. Density {d:.3f}.",
         ],
         "BruteForce": [
-            f"Brute force attack pattern with {n} nodes involved. Repeated connection attempts ({e} edges) to authentication services. Confidence: {conf:.0%}.",
-            f"Authentication brute force attack: {e} login attempts targeting {n} nodes.",
+            f"Brute force traffic with {n} nodes. Repeated connection patterns ({e} edges) to services.",
+            f"Authentication attack traffic: {e} connection attempts targeting {n} nodes.",
         ],
         "WebAttack": [
-            f"Web application attack detected involving {n} nodes. HTTP/HTTPS traffic shows {e} malicious request patterns. Confidence: {conf:.0%}.",
-            f"Web-based attack: {e} HTTP connections to {n} targets. Graph density {d:.3f} suggests targeted web exploitation.",
+            f"Web attack traffic involving {n} nodes. {e} HTTP connections, density {d:.3f}.",
+            f"Web-based attack: {e} connections to {n} targets with max degree {md}.",
         ],
         "Bot/Other": [
-            f"Botnet C&C communication detected: {n} compromised hosts with {e} coordination edges. Confidence: {conf:.0%}.",
-            f"Botnet activity with {n} infected nodes and {e} C&C connections. Network structure shows {nc} botnet cluster(s).",
+            f"Botnet/anomalous traffic: {n} hosts with {e} connections in {nc} cluster(s).",
+            f"Suspicious traffic pattern with {n} nodes and {e} coordination edges.",
         ],
     }
 
-    t = templates.get(attack_type, [
-        f"Network traffic graph with {n} nodes and {e} edges. Attack type: {attack_type}. Average degree {ad:.1f}, density {d:.3f}.",
+    t = templates.get(gt, [
+        f"Network traffic graph with {n} nodes, {e} edges. Type: {gt}. Density {d:.3f}.",
     ])
 
     hash_val = int(hashlib.md5(str(stats).encode()).hexdigest(), 16)
@@ -84,22 +91,22 @@ def generate_summary(results):
     if not results:
         return "No matching network activity found."
 
-    attack_counts = Counter()
+    gt_counts = Counter()
     total_nodes = 0
     total_edges = 0
 
     for r in results:
         stats = r['stats']
-        attack_counts[stats['attack_name']] += 1
+        gt_counts[stats['gt_label']] += 1
         total_nodes += stats['num_nodes']
         total_edges += stats['num_edges']
 
     parts = []
-    for attack_type, count in attack_counts.most_common():
-        if attack_type == "Benign":
+    for label, count in gt_counts.most_common():
+        if label == "Benign":
             parts.append(f"{count} benign traffic window(s)")
         else:
-            parts.append(f"{count} {attack_type} attack(s)")
+            parts.append(f"{count} {label} window(s)")
 
     summary = f"Found {len(results)} matching graph snapshots: {', '.join(parts)}. "
     summary += f"Total: {total_nodes} network nodes, {total_edges} connections across matched windows."

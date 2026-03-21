@@ -1,751 +1,779 @@
 #!/usr/bin/env python3
 """
-Attack Simulation & Capture Script — CIC-IDS2017 Realistic Patterns
+Attack Simulation — Scapy Offline Packet Construction (CIC-IDS2017 Realistic)
 
-Simulates network attacks that produce flow features matching the CIC-IDS2017
-dataset characteristics. Each attack type mimics the real tool behavior:
+Generates .pcap files with crafted packets matching CIC-IDS2017 feature
+distributions. No network access, sudo, or running services required.
 
-  - DoS Hulk:       Long-lived HTTP floods (~85s flows, small requests, large responses)
-  - DoS GoldenEye:  HTTP keep-alive abuse (~12s flows, slow requests)
-  - DoS Slowloris:  Partial HTTP headers to hold connections open (~97s flows)
-  - DDoS:           Short HTTP floods from single source (~2s flows)
-  - PortScan:       Rapid SYN probes across many ports (~47μs flows)
-  - Web Attack:     Brute force login attempts (~5s flows)
-  - FTP Brute Force: Credential stuffing on FTP (~4s flows)
-  - SSH Brute Force: Credential stuffing on SSH (~2.5s flows)
-  - Benign:         Normal HTTP/HTTPS browsing with varied timing
+Each attack type produces packets with IPs, ports, payload sizes, timing,
+and TCP flags that match the training data so the GNN classifier recognizes them.
 
 Usage:
-    sudo python simulate_attacks.py --attack all
-    sudo python simulate_attacks.py --attack dos-hulk
-    sudo python simulate_attacks.py --attack slowloris
-    sudo python simulate_attacks.py --attack portscan
-    sudo python simulate_attacks.py --continuous --interval 60
-
-Prerequisites:
-    pip install scapy       # already installed
-    # Requires sudo for raw packet capture and crafting
+    python simulate_attacks.py --attack all
+    python simulate_attacks.py --attack dos-hulk
+    python simulate_attacks.py --attack portscan --duration 30
+    python simulate_attacks.py --continuous --interval 60
 """
 
 import os
-import sys
 import time
-import signal
-import socket
 import random
 import argparse
-import subprocess
-import threading
 from datetime import datetime
 
-WIRESHARK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wireshark")
-CAPTURE_INTERFACE = "lo0"  # loopback on macOS; use "lo" on Linux
+from scapy.all import Ether, IP, TCP, Raw, wrpcap
 
-# CIC-IDS2017 uses these IPs — we use localhost equivalents
-ATTACKER_IP = "127.0.0.1"
-VICTIM_IP = "127.0.0.1"
+# ---------------------------------------------------------------------------
+# Constants — IPs and ports matching CIC-IDS2017 dataset
+# ---------------------------------------------------------------------------
+
+WIRESHARK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wireshark")
+
+VICTIM_IP = "192.168.10.50"
+ATTACKER_IPS = ["172.16.0.1", "172.16.0.2", "172.16.0.3"]
+
+# Benign IPs — CIC-IDS2017 has ~170 unique IPs per 30s window.
+# We generate traffic from a pool of diverse IPs to match graph density.
+BENIGN_INTERNAL_IPS = [f"192.168.10.{i}" for i in range(3, 51) if i != 50]
+BENIGN_EXTERNAL_IPS = ([f"52.84.{random.randint(0,255)}.{random.randint(1,254)}" for _ in range(30)] +
+                       [f"54.192.{random.randint(0,255)}.{random.randint(1,254)}" for _ in range(20)] +
+                       [f"172.217.{random.randint(0,15)}.{random.randint(1,254)}" for _ in range(15)] +
+                       [f"13.{random.randint(52,59)}.{random.randint(0,255)}.{random.randint(1,254)}" for _ in range(15)] +
+                       [f"104.{random.randint(16,31)}.{random.randint(0,255)}.{random.randint(1,254)}" for _ in range(10)] +
+                       [f"10.0.{random.randint(0,10)}.{random.randint(1,254)}" for _ in range(10)])
+BENIGN_IPS = BENIGN_INTERNAL_IPS + BENIGN_EXTERNAL_IPS  # ~150 unique IPs
+
+SRC_MAC = "00:0c:29:aa:bb:01"
+DST_MAC = "00:0c:29:cc:dd:02"
 
 
 def get_timestamp():
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
-def start_capture(output_name, duration=60, interface=None):
-    """Start packet capture in background using tcpdump."""
-    if interface is None:
-        interface = CAPTURE_INTERFACE
-    output_path = os.path.join(WIRESHARK_DIR, f"{output_name}_{get_timestamp()}.pcapng")
+def jitter(mean, std, min_val=0.0):
+    """Gaussian jitter clamped to min_val."""
+    return max(min_val, random.gauss(mean, std))
 
-    if subprocess.run(["which", "tshark"], capture_output=True).returncode == 0:
-        cmd = ["tshark", "-i", interface, "-a", f"duration:{duration}",
-               "-w", output_path, "-F", "pcapng"]
+
+def rand_high_port():
+    return random.randint(1024, 65535)
+
+
+# ---------------------------------------------------------------------------
+# Core: Build a complete bidirectional TCP session as a packet list
+# ---------------------------------------------------------------------------
+
+def build_tcp_session(
+    src_ip, dst_ip, sport, dport,
+    fwd_payloads, bwd_payloads,
+    base_time,
+    fwd_iats, bwd_delays,
+    init_win_fwd=8192, init_win_bwd=65535,
+    include_fin=True,
+    include_handshake=True,
+    fwd_data_flag='PA', bwd_data_flag='PA',
+):
+    """Build a complete TCP session with proper seq/ack tracking.
+
+    Args:
+        src_ip, dst_ip: IP addresses (client, server)
+        sport, dport: TCP ports
+        fwd_payloads: list of bytes — client-to-server data packets
+        bwd_payloads: list of bytes — server-to-client data packets
+        base_time: float Unix epoch for first packet (SYN)
+        fwd_iats: list of float — seconds between consecutive fwd data packets
+        bwd_delays: list of float — delay after corresponding fwd packet for server response
+        init_win_fwd: TCP window on SYN (becomes Init_Win_bytes_forward)
+        init_win_bwd: TCP window on SYN-ACK (becomes Init_Win_bytes_backward)
+        include_fin: whether to add FIN/ACK teardown
+        include_handshake: whether to include SYN/SYN-ACK/ACK handshake
+            CIC-IDS2017 shows SYN Flag Count=0 for most attack flows because
+            CICFlowMeter often misses the handshake or counts flags as boolean.
+            Skipping handshake → SYN=0 matching the training data.
+        fwd_data_flag: TCP flag string for forward data packets (default 'PA').
+            Use 'A' for ACK-only to reduce PSH Flag Count to 0.
+        bwd_data_flag: TCP flag string for backward data packets (default 'PA').
+
+    Returns:
+        list of Scapy packets sorted by timestamp
+    """
+    packets = []
+    t = base_time
+
+    client_isn = random.randint(100000, 4000000000)
+    server_isn = random.randint(100000, 4000000000)
+    c_seq = client_isn
+    s_seq = server_isn
+
+    def _pkt(src, dst, sp, dp, flags, seq, ack, win, payload=None, ts=None):
+        p = (Ether(src=SRC_MAC, dst=DST_MAC) /
+             IP(src=src, dst=dst) /
+             TCP(sport=sp, dport=dp, flags=flags, seq=seq, ack=ack, window=win))
+        if payload:
+            p = p / Raw(load=payload)
+        p.time = ts
+        return p
+
+    # --- 3-way handshake (optional) ---
+    if include_handshake:
+        # SYN
+        packets.append(_pkt(src_ip, dst_ip, sport, dport, 'S', c_seq, 0,
+                            init_win_fwd, ts=t))
+        c_seq += 1
+        t += 0.0005
+
+        # SYN-ACK
+        packets.append(_pkt(dst_ip, src_ip, dport, sport, 'SA', s_seq, c_seq,
+                            init_win_bwd, ts=t))
+        s_seq += 1
+        t += 0.0005
+
+        # ACK
+        packets.append(_pkt(src_ip, dst_ip, sport, dport, 'A', c_seq, s_seq,
+                            init_win_fwd, ts=t))
     else:
-        cmd = ["sudo", "tcpdump", "-i", interface, "-G", str(duration),
-               "-W", "1", "-w", output_path]
+        # Even without handshake, advance seq as if it happened
+        c_seq += 1
+        s_seq += 1
 
-    print(f"  Capturing on {interface} -> {os.path.basename(output_path)}")
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(1)
-    return proc, output_path
+    # --- Data exchange ---
+    # Interleave fwd and bwd packets
+    num_exchanges = max(len(fwd_payloads), len(bwd_payloads))
+    for i in range(num_exchanges):
+        # Forward data packet
+        if i < len(fwd_payloads):
+            if i < len(fwd_iats):
+                t += fwd_iats[i]
+            else:
+                t += fwd_iats[-1] if fwd_iats else 0.5
+            payload = fwd_payloads[i]
+            packets.append(_pkt(src_ip, dst_ip, sport, dport, fwd_data_flag,
+                                c_seq, s_seq, init_win_fwd, payload=payload, ts=t))
+            c_seq += len(payload)
+
+        # Backward data packet (server response)
+        if i < len(bwd_payloads):
+            delay = bwd_delays[i] if i < len(bwd_delays) else 0.05
+            t += delay
+            payload = bwd_payloads[i]
+            packets.append(_pkt(dst_ip, src_ip, dport, sport, bwd_data_flag,
+                                s_seq, c_seq, init_win_bwd, payload=payload, ts=t))
+            s_seq += len(payload)
+
+            # Client ACK for server data
+            t += 0.0002
+            packets.append(_pkt(src_ip, dst_ip, sport, dport, 'A', c_seq, s_seq,
+                                init_win_fwd, ts=t))
+
+    # --- FIN/ACK teardown ---
+    if include_fin:
+        t += 0.01
+        packets.append(_pkt(src_ip, dst_ip, sport, dport, 'FA', c_seq, s_seq,
+                            init_win_fwd, ts=t))
+        c_seq += 1
+        t += 0.0005
+        packets.append(_pkt(dst_ip, src_ip, dport, sport, 'FA', s_seq, c_seq,
+                            init_win_bwd, ts=t))
+        s_seq += 1
+        t += 0.0005
+        packets.append(_pkt(src_ip, dst_ip, sport, dport, 'A', c_seq, s_seq,
+                            init_win_fwd, ts=t))
+
+    return packets
 
 
-def stop_capture(proc):
-    """Stop capture process gracefully."""
-    if proc.poll() is None:
-        proc.send_signal(signal.SIGINT)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-
-
-# ---------------------------------------------------------------------------
-# Target servers — simple TCP listeners that respond like real services
-# ---------------------------------------------------------------------------
-
-def _start_http_server(port):
-    """Start a simple HTTP server that returns large responses (like real web servers)."""
-    server = subprocess.Popen(
-        [sys.executable, "-m", "http.server", str(port), "--bind", "127.0.0.1"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    time.sleep(0.5)
-    return server
-
-
-def _start_tcp_listener(port):
-    """Start a raw TCP listener that accepts and holds connections."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("127.0.0.1", port))
-    sock.listen(1024)
-    sock.settimeout(1.0)
-
-    def _accept_loop():
-        conns = []
-        while not _stop_flag.is_set():
-            try:
-                conn, _ = sock.accept()
-                conns.append(conn)
-            except socket.timeout:
-                pass
-            except OSError:
-                break
-        for c in conns:
-            try:
-                c.close()
-            except Exception:
-                pass
-        sock.close()
-
-    _stop_flag = threading.Event()
-    t = threading.Thread(target=_accept_loop, daemon=True)
-    t.start()
-    return sock, _stop_flag
+def write_pcap(packets, output_name):
+    """Sort packets by time and write to pcap file."""
+    packets.sort(key=lambda p: p.time)
+    path = os.path.join(WIRESHARK_DIR, f"{output_name}_{get_timestamp()}.pcap")
+    wrpcap(path, packets)
+    return path
 
 
 # ---------------------------------------------------------------------------
-# DoS Hulk — CIC-IDS2017 characteristics:
-#   Duration: median 85s, Fwd pkts: 5, Bwd pkts: 4
-#   Fwd len: 46B (small GET/POST), Bwd len: 1656B (large response)
-#   Flow IAT: ~6.6s between packets, Port: 80
+# HTTP helpers
+# ---------------------------------------------------------------------------
+
+def make_http_request(path="/", host="192.168.10.50", extra_headers=""):
+    """Build a simple HTTP GET request."""
+    req = f"GET {path} HTTP/1.1\r\nHost: {host}\r\n"
+    if extra_headers:
+        req += extra_headers
+    req += "\r\n"
+    return req.encode()
+
+
+def make_http_response(body_size=1200, status="200 OK"):
+    """Build an HTTP response with a body of specified size."""
+    body = b"X" * body_size
+    resp = (f"HTTP/1.1 {status}\r\n"
+            f"Content-Length: {body_size}\r\n"
+            f"Connection: keep-alive\r\n"
+            f"\r\n").encode() + body
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# Benign background traffic — creates realistic graph density (~150+ IPs)
+#
+# CIC-IDS2017 has median 166 unique IPs per 30s window, and attack traffic
+# ALWAYS coexists with benign traffic (benign:attack ratio median ~10:1).
+# Without this background, graphs have only 3-4 nodes and the GNN produces
+# out-of-distribution embeddings.
+# ---------------------------------------------------------------------------
+
+def generate_benign_background(base_time, duration, num_sessions=None):
+    """Generate diverse benign HTTP/HTTPS sessions spread across many IPs.
+
+    Returns a list of packets to mix into attack pcaps.
+    Targets ~100-150 unique IPs to match CIC-IDS2017 graph density.
+    """
+    if num_sessions is None:
+        # ~10:1 benign:attack ratio with enough IPs for graph density
+        num_sessions = random.randint(120, 180)
+
+    packets = []
+    # Sample from the full IP pool — each session uses a different client IP
+    ips_to_use = random.sample(BENIGN_IPS, min(num_sessions, len(BENIGN_IPS)))
+
+    # Common server IPs that benign traffic targets (besides VICTIM_IP)
+    servers = [VICTIM_IP, "192.168.10.51", "192.168.10.52"]
+    pages = ["/", "/index.html", "/about", "/api/status", "/images/logo.png",
+             "/css/style.css", "/js/app.js", "/contact", "/search?q=test"]
+
+    for i in range(num_sessions):
+        src_ip = ips_to_use[i % len(ips_to_use)]
+        dst_ip = random.choice(servers)
+        sport = rand_high_port()
+        dport = random.choice([80, 80, 80, 443, 443, 8080])  # mostly port 80
+
+        # Stagger sessions across the full duration
+        session_start = base_time + random.uniform(0, duration)
+
+        # Normal browsing: 1-3 requests per session
+        n_fwd = random.randint(1, 3)
+        n_bwd = random.randint(1, 3)
+
+        fwd_payloads = [make_http_request(path=random.choice(pages), host=dst_ip)
+                        for _ in range(n_fwd)]
+        bwd_payloads = [make_http_response(
+                            body_size=random.randint(200, 3000),
+                            status=random.choice(["200 OK", "200 OK", "200 OK", "304 Not Modified"]))
+                        for _ in range(n_bwd)]
+
+        # Natural timing: 0.5-3s between requests
+        fwd_iats = [jitter(1.5, 1.0, 0.1) for _ in range(n_fwd)]
+        bwd_delays = [jitter(0.05, 0.03, 0.01) for _ in range(n_bwd)]
+
+        # CIC-IDS2017 benign Init_Win distribution:
+        # fwd: -1 (46%), 8192 (12%), 29200 (11%), 65535 (8%), others
+        # bwd: -1 (46%), 65535 (11%), 29200 (8%), others
+        # Note: -1 in CICFlowMeter means no SYN seen; we use 0 as TCP window equivalent
+        benign_win_fwd = random.choices(
+            [0, 8192, 29200, 65535, 64240],
+            weights=[46, 12, 11, 8, 5], k=1)[0]
+        benign_win_bwd = random.choices(
+            [0, 65535, 29200, 64240, 8192],
+            weights=[46, 11, 8, 5, 4], k=1)[0]
+
+        packets.extend(build_tcp_session(
+            src_ip, dst_ip, sport, dport,
+            fwd_payloads, bwd_payloads,
+            session_start, fwd_iats, bwd_delays,
+            init_win_fwd=benign_win_fwd, init_win_bwd=benign_win_bwd,
+        ))
+
+    return packets
+
+
+# ---------------------------------------------------------------------------
+# DoS Hulk — Duration ~85s, IAT ~4.8s, Fwd 44B, Bwd 1281B, ACK-dominant
 # ---------------------------------------------------------------------------
 
 def simulate_dos_hulk(duration=90):
-    """Simulate DoS Hulk: long-lived HTTP connections with periodic requests.
+    print(f"\n[DoS Hulk] Generating pcap ({duration}s window)...")
+    base = time.time()
+    packets = generate_benign_background(base, duration)
+    num_sessions = random.randint(20, 30)
 
-    Hulk sends randomized HTTP requests to bypass caching, keeping connections
-    alive for ~85s with ~6.6s between requests.
-    """
-    print(f"\n[DoS Hulk] Simulating HTTP flood for {duration}s...")
-    print("  Pattern: Long-lived connections, ~6.6s between requests, port 80")
+    for i in range(num_sessions):
+        src_ip = ATTACKER_IPS[i % 2]  # 2 attacker IPs
+        sport = rand_high_port()
+        session_start = base + jitter(i * (duration / num_sessions), 1.0, 0)
 
-    port = 18080
-    server = _start_http_server(port)
-    proc, path = start_capture("dos_hulk_sim", duration=duration + 10)
+        # ~5 fwd packets, ~4 bwd packets per session
+        n_fwd = random.randint(4, 6)
+        n_bwd = random.randint(3, 5)
 
-    # Create multiple persistent connections that send requests slowly
-    num_connections = 50
-    threads = []
-    stop_event = threading.Event()
+        fwd_payloads = []
+        for _ in range(n_fwd):
+            rand_param = random.randint(1000, 9999)
+            req = make_http_request(
+                path=f"/?q={rand_param}",
+                extra_headers="Connection: keep-alive\r\n"
+            )
+            # Pad/trim to ~44 bytes payload
+            fwd_payloads.append(req[:max(40, min(50, len(req)))])
 
-    def _hulk_worker(worker_id):
-        """One persistent HTTP connection sending periodic requests."""
-        while not stop_event.is_set():
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(10)
-                s.connect(("127.0.0.1", port))
+        bwd_payloads = [make_http_response(body_size=random.randint(1200, 1350))
+                        for _ in range(n_bwd)]
 
-                # Send ~5 requests per connection with ~6.6s gaps (like real Hulk)
-                for _ in range(random.randint(3, 7)):
-                    if stop_event.is_set():
-                        break
+        # IAT: mean 4.8s, std 3s (high variability like dataset)
+        fwd_iats = [jitter(4.8, 3.0, 0.5) for _ in range(n_fwd)]
+        bwd_delays = [jitter(0.05, 0.02, 0.01) for _ in range(n_bwd)]
 
-                    # Randomized GET request (~46 bytes like CIC-IDS2017)
-                    rand_param = random.randint(1000, 9999)
-                    request = (
-                        f"GET /?q={rand_param} HTTP/1.1\r\n"
-                        f"Host: 127.0.0.1:{port}\r\n"
-                        f"Connection: keep-alive\r\n"
-                        f"\r\n"
-                    )
-                    s.sendall(request.encode())
+        # CIC-IDS2017 DoS Hulk Init_Win distribution:
+        # fwd: 251 (40%), 274 (28%), 0/-1 (26%), 29200 (6%)
+        # bwd: 235 (71%), -1/0 (29%)
+        win_fwd = random.choices([251, 274, 0, 29200], weights=[40, 28, 26, 6], k=1)[0]
+        win_bwd = random.choices([235, 0], weights=[71, 29], k=1)[0]
 
-                    # Read response (server sends ~1656 bytes back)
-                    try:
-                        s.recv(4096)
-                    except socket.timeout:
-                        pass
+        packets.extend(build_tcp_session(
+            src_ip, VICTIM_IP, sport, 80,
+            fwd_payloads, bwd_payloads,
+            session_start, fwd_iats, bwd_delays,
+            init_win_fwd=win_fwd, init_win_bwd=win_bwd,
+            include_handshake=False,  # SYN Flag Count=0 in CIC-IDS2017
+            include_fin=False,        # FIN Flag Count=0
+            fwd_data_flag='A',        # ACK-dominant, PSH=0 (93.7% of flows)
+            bwd_data_flag='A',
+        ))
 
-                    # Wait ~6.6s between requests (matching CIC-IDS2017 IAT)
-                    stop_event.wait(random.uniform(5.0, 8.0))
-
-                s.close()
-            except (ConnectionRefusedError, socket.timeout, OSError, BrokenPipeError):
-                stop_event.wait(1)
-
-    for i in range(num_connections):
-        t = threading.Thread(target=_hulk_worker, args=(i,), daemon=True)
-        t.start()
-        threads.append(t)
-        time.sleep(0.1)  # stagger connection starts
-
-    # Let it run
-    time.sleep(duration)
-    stop_event.set()
-    for t in threads:
-        t.join(timeout=3)
-
-    server.kill()
-    stop_capture(proc)
-    print(f"  Saved: {os.path.basename(path)}")
+    path = write_pcap(packets, "dos_hulk_sim")
+    print(f"  Saved: {os.path.basename(path)} ({len(packets)} packets, {num_sessions} sessions)")
     return path
 
 
 # ---------------------------------------------------------------------------
-# DoS GoldenEye — CIC-IDS2017 characteristics:
-#   Duration: median 11.6s, Fwd pkts: 7, Bwd pkts: 5
-#   Fwd len: 53B, Bwd len: 1175B, Flow IAT: ~1.1s, Port: 80
+# DoS GoldenEye — Duration ~12s, IAT ~2.3s, Fwd 59B, Bwd 1257B, PSH-dominant
 # ---------------------------------------------------------------------------
 
 def simulate_dos_goldeneye(duration=60):
-    """Simulate DoS GoldenEye: HTTP keep-alive abuse with moderate timing.
+    print(f"\n[DoS GoldenEye] Generating pcap ({duration}s window)...")
+    base = time.time()
+    packets = generate_benign_background(base, duration)
+    num_sessions = random.randint(25, 35)
 
-    GoldenEye opens many connections and sends requests every ~1.1s,
-    each connection lasting ~12s.
-    """
-    print(f"\n[DoS GoldenEye] Simulating for {duration}s...")
-    print("  Pattern: Keep-alive abuse, ~1.1s between requests, ~12s connections")
+    agents = ["Mozilla/5.0", "Chrome/91.0", "Safari/537.36", "curl/7.68"]
 
-    port = 18080
-    server = _start_http_server(port)
-    proc, path = start_capture("dos_goldeneye_sim", duration=duration + 10)
+    for i in range(num_sessions):
+        src_ip = ATTACKER_IPS[i % 2]
+        sport = rand_high_port()
+        session_start = base + jitter(i * (duration / num_sessions), 0.5, 0)
 
-    num_connections = 80
-    stop_event = threading.Event()
-    threads = []
+        n_fwd = random.randint(5, 7)
+        n_bwd = random.randint(3, 5)
 
-    def _goldeneye_worker(worker_id):
-        while not stop_event.is_set():
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(5)
-                s.connect(("127.0.0.1", port))
+        fwd_payloads = []
+        for _ in range(n_fwd):
+            req = make_http_request(
+                path=f"/?{random.randint(1, 9999)}",
+                extra_headers=(f"User-Agent: {random.choice(agents)}\r\n"
+                               f"Connection: keep-alive\r\n")
+            )
+            # Trim to ~59 bytes
+            fwd_payloads.append(req[:max(55, min(65, len(req)))])
 
-                # ~7 fwd packets, ~5 bwd over ~12s connection
-                for _ in range(random.randint(5, 9)):
-                    if stop_event.is_set():
-                        break
+        bwd_payloads = [make_http_response(body_size=random.randint(1180, 1330))
+                        for _ in range(n_bwd)]
 
-                    # Randomized request with varied User-Agent (~53 bytes payload)
-                    agents = ["Mozilla/5.0", "Chrome/91.0", "Safari/537.36", "curl/7.68"]
-                    request = (
-                        f"GET /?{random.randint(1, 9999)} HTTP/1.1\r\n"
-                        f"Host: 127.0.0.1:{port}\r\n"
-                        f"User-Agent: {random.choice(agents)}\r\n"
-                        f"Connection: keep-alive\r\n"
-                        f"\r\n"
-                    )
-                    s.sendall(request.encode())
-                    try:
-                        s.recv(4096)
-                    except socket.timeout:
-                        pass
+        fwd_iats = [jitter(2.3, 1.0, 0.3) for _ in range(n_fwd)]
+        bwd_delays = [jitter(0.05, 0.02, 0.01) for _ in range(n_bwd)]
 
-                    # ~1.1s IAT between requests
-                    stop_event.wait(random.uniform(0.8, 1.5))
+        # CIC-IDS2017 GoldenEye Init_Win: similar to Hulk
+        # fwd: 251 (35%), 274 (30%), 0 (25%), 29200 (10%)
+        # bwd: 235 (65%), 0 (35%)
+        win_fwd = random.choices([251, 274, 0, 29200], weights=[35, 30, 25, 10], k=1)[0]
+        win_bwd = random.choices([235, 0], weights=[65, 35], k=1)[0]
 
-                s.close()
-            except (ConnectionRefusedError, socket.timeout, OSError, BrokenPipeError):
-                stop_event.wait(0.5)
+        packets.extend(build_tcp_session(
+            src_ip, VICTIM_IP, sport, 80,
+            fwd_payloads, bwd_payloads,
+            session_start, fwd_iats, bwd_delays,
+            init_win_fwd=win_fwd, init_win_bwd=win_bwd,
+            include_handshake=False,
+            include_fin=False,
+            fwd_data_flag='PA',  # PSH-dominant (72%) for GoldenEye
+            bwd_data_flag='A',
+        ))
 
-    for i in range(num_connections):
-        t = threading.Thread(target=_goldeneye_worker, args=(i,), daemon=True)
-        t.start()
-        threads.append(t)
-        time.sleep(0.05)
-
-    time.sleep(duration)
-    stop_event.set()
-    for t in threads:
-        t.join(timeout=3)
-
-    server.kill()
-    stop_capture(proc)
-    print(f"  Saved: {os.path.basename(path)}")
+    path = write_pcap(packets, "dos_goldeneye_sim")
+    print(f"  Saved: {os.path.basename(path)} ({len(packets)} packets, {num_sessions} sessions)")
     return path
 
 
 # ---------------------------------------------------------------------------
-# DoS Slowloris — CIC-IDS2017 characteristics:
-#   Duration: median 97s, Fwd pkts: 3, Bwd pkts: 2
-#   Fwd len: 8B (tiny headers), Bwd len: 0B (server starved)
-#   Extremely low throughput (~2.23 bytes/s), Port: 80
+# DoS Slowloris — Duration ~97s, IAT extreme variability, tiny fwd, minimal bwd
 # ---------------------------------------------------------------------------
 
 def simulate_slowloris(duration=120):
-    """Simulate Slowloris: hold connections open with partial HTTP headers.
+    print(f"\n[Slowloris] Generating pcap ({duration}s window)...")
+    base = time.time()
+    packets = generate_benign_background(base, duration)
+    num_sessions = random.randint(15, 20)
 
-    Sends incomplete HTTP headers very slowly, keeping connections alive
-    for ~97s while sending only ~8 bytes at a time.
-    """
-    print(f"\n[Slowloris] Simulating for {duration}s...")
-    print("  Pattern: Partial headers, ~8 bytes/send, connections held ~97s")
+    for i in range(num_sessions):
+        src_ip = ATTACKER_IPS[i % 2]
+        sport = rand_high_port()
+        session_start = base + jitter(i * (min(duration, 97) / num_sessions), 2.0, 0)
 
-    port = 18080
-    server = _start_http_server(port)
-    proc, path = start_capture("dos_slowloris_sim", duration=duration + 10)
+        # 6 fwd packets (tiny partial headers), 2 bwd packets (minimal)
+        n_fwd = random.randint(5, 7)
+        n_bwd = random.randint(1, 2)
 
-    num_connections = 100
-    stop_event = threading.Event()
-    threads = []
+        # First fwd packet: partial HTTP request line
+        fwd_payloads = [b"GET / HTTP/1.1\r\n"]
+        # Remaining: tiny header fragments ~8-10 bytes
+        for _ in range(n_fwd - 1):
+            header = f"X-a: {random.randint(1, 99)}\r\n".encode()
+            fwd_payloads.append(header)
 
-    def _slowloris_worker(worker_id):
-        while not stop_event.is_set():
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(10)
-                s.connect(("127.0.0.1", port))
+        # Minimal backward: just a small response or ACK data
+        bwd_payloads = [b"\r\n" * random.randint(1, 4) for _ in range(n_bwd)]
 
-                # Send initial partial header
-                s.sendall(b"GET / HTTP/1.1\r\n")
-                s.sendall(f"Host: 127.0.0.1:{port}\r\n".encode())
+        # IAT: mean 16s, std 22s — EXTREME variability (dataset signature)
+        fwd_iats = [jitter(16.0, 22.0, 1.0) for _ in range(n_fwd)]
+        # Cap total duration near 97s
+        total_iat = sum(fwd_iats)
+        if total_iat > 100:
+            scale = 97.0 / total_iat
+            fwd_iats = [iat * scale for iat in fwd_iats]
 
-                # Keep connection alive by sending partial headers (~8 bytes each)
-                # for ~97s, with long pauses between sends
-                for _ in range(random.randint(2, 5)):
-                    if stop_event.is_set():
-                        break
+        bwd_delays = [jitter(0.5, 0.3, 0.1) for _ in range(n_bwd)]
 
-                    # Send tiny header fragment (~8 bytes, matching CIC-IDS2017)
-                    header = f"X-a: {random.randint(1, 99)}\r\n"
-                    s.sendall(header.encode())
+        # CIC-IDS2017 Slowloris Init_Win:
+        # fwd: 29200 (60%), 251 (20%), 0 (20%)
+        # bwd: 235 (50%), 0 (50%)
+        win_fwd = random.choices([29200, 251, 0], weights=[60, 20, 20], k=1)[0]
+        win_bwd = random.choices([235, 0], weights=[50, 50], k=1)[0]
 
-                    # Long pause between sends (total ~97s / ~3 sends = ~30s each)
-                    stop_event.wait(random.uniform(20.0, 40.0))
+        packets.extend(build_tcp_session(
+            src_ip, VICTIM_IP, sport, 80,
+            fwd_payloads, bwd_payloads,
+            session_start, fwd_iats, bwd_delays,
+            init_win_fwd=win_fwd, init_win_bwd=win_bwd,
+            include_handshake=False,
+            include_fin=False,  # Slowloris doesn't cleanly close
+            fwd_data_flag='PA',  # PSH 67% for Slowloris partial headers
+            bwd_data_flag='A',
+        ))
 
-                s.close()
-            except (ConnectionRefusedError, socket.timeout, OSError, BrokenPipeError):
-                stop_event.wait(2)
-
-    for i in range(num_connections):
-        t = threading.Thread(target=_slowloris_worker, args=(i,), daemon=True)
-        t.start()
-        threads.append(t)
-        time.sleep(0.2)
-
-    time.sleep(duration)
-    stop_event.set()
-    for t in threads:
-        t.join(timeout=3)
-
-    server.kill()
-    stop_capture(proc)
-    print(f"  Saved: {os.path.basename(path)}")
+    path = write_pcap(packets, "dos_slowloris_sim")
+    print(f"  Saved: {os.path.basename(path)} ({len(packets)} packets, {num_sessions} sessions)")
     return path
 
 
 # ---------------------------------------------------------------------------
-# DDoS — CIC-IDS2017 characteristics:
-#   Duration: median 1.9s, Fwd pkts: 4, Bwd pkts: 4
-#   Fwd len: 7B (tiny), Bwd len: 1934B (large response)
-#   Flow IAT: ~489ms, Port: 80
+# DDoS — Duration ~2s, IAT ~0.5s, Fwd 7B, Bwd 1481B, multiple sources
 # ---------------------------------------------------------------------------
 
 def simulate_ddos(duration=60):
-    """Simulate DDoS: short burst HTTP floods.
+    print(f"\n[DDoS] Generating pcap ({duration}s window)...")
+    base = time.time()
+    packets = generate_benign_background(base, duration)
+    num_sessions = random.randint(50, 80)
 
-    Many short-lived connections (~2s each) sending small requests
-    that trigger large responses.
-    """
-    print(f"\n[DDoS] Simulating for {duration}s...")
-    print("  Pattern: Short bursts ~2s, 4 pkts each, ~489ms IAT")
+    # DDoS uses all 3 attacker IPs (dataset shows bidirectional 2-IP pattern)
+    for i in range(num_sessions):
+        src_ip = ATTACKER_IPS[i % 3]
+        sport = rand_high_port()
+        # Rapid succession — many short sessions packed together
+        session_start = base + jitter(i * (duration / num_sessions), 0.3, 0)
 
-    port = 18080
-    server = _start_http_server(port)
-    proc, path = start_capture("ddos_sim", duration=duration + 10)
+        n_fwd = random.randint(4, 5)
+        n_bwd = random.randint(2, 4)
 
-    stop_event = threading.Event()
-    threads = []
+        # Tiny fwd payloads (~7 bytes)
+        fwd_payloads = [b"GET / HTTP/1.1\r\n\r\n"[:random.randint(5, 10)]
+                        for _ in range(n_fwd)]
 
-    def _ddos_worker():
-        while not stop_event.is_set():
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(3)
-                s.connect(("127.0.0.1", port))
+        # Large bwd payloads (~1481 bytes)
+        bwd_payloads = [make_http_response(body_size=random.randint(1400, 1560))
+                        for _ in range(n_bwd)]
 
-                # ~4 requests over ~2s connection
-                for _ in range(random.randint(3, 5)):
-                    if stop_event.is_set():
-                        break
-                    request = (
-                        f"GET / HTTP/1.1\r\n"
-                        f"Host: 127.0.0.1\r\n"
-                        f"\r\n"
-                    )
-                    s.sendall(request.encode())
-                    try:
-                        s.recv(4096)
-                    except socket.timeout:
-                        pass
-                    # ~489ms IAT
-                    stop_event.wait(random.uniform(0.3, 0.7))
+        # Short IAT ~0.5s
+        fwd_iats = [jitter(0.5, 0.2, 0.1) for _ in range(n_fwd)]
+        bwd_delays = [jitter(0.03, 0.01, 0.01) for _ in range(n_bwd)]
 
-                s.close()
-            except (ConnectionRefusedError, socket.timeout, OSError, BrokenPipeError):
-                pass
-            # Brief pause before next connection
-            stop_event.wait(random.uniform(0.1, 0.5))
+        # CIC-IDS2017 DDoS Init_Win:
+        # fwd: 227 (40%), 8192 (30%), 0 (20%), 29200 (10%)
+        # bwd: 235 (60%), 0 (40%)
+        win_fwd = random.choices([227, 8192, 0, 29200], weights=[40, 30, 20, 10], k=1)[0]
+        win_bwd = random.choices([235, 0], weights=[60, 40], k=1)[0]
 
-    # Many concurrent workers to create high volume
-    for _ in range(100):
-        t = threading.Thread(target=_ddos_worker, daemon=True)
-        t.start()
-        threads.append(t)
+        packets.extend(build_tcp_session(
+            src_ip, VICTIM_IP, sport, 80,
+            fwd_payloads, bwd_payloads,
+            session_start, fwd_iats, bwd_delays,
+            init_win_fwd=win_fwd, init_win_bwd=win_bwd,
+            include_handshake=False,
+            include_fin=False,
+            fwd_data_flag='A',
+            bwd_data_flag='A',
+        ))
 
-    time.sleep(duration)
-    stop_event.set()
-    for t in threads:
-        t.join(timeout=3)
-
-    server.kill()
-    stop_capture(proc)
-    print(f"  Saved: {os.path.basename(path)}")
+    path = write_pcap(packets, "ddos_sim")
+    print(f"  Saved: {os.path.basename(path)} ({len(packets)} packets, {num_sessions} sessions)")
     return path
 
 
 # ---------------------------------------------------------------------------
-# PortScan — CIC-IDS2017 characteristics:
-#   Duration: median 47 microseconds (extremely fast)
-#   Fwd pkts: 1, Bwd pkts: 1 (SYN/SYN-ACK)
-#   Fwd len: 0B, Bwd len: 6B
-#   Scans thousands of ports rapidly
+# PortScan — Duration ~47µs per probe, SYN→RST, many ports
 # ---------------------------------------------------------------------------
 
 def simulate_portscan(duration=30):
-    """Simulate PortScan: rapid TCP connect probes across many ports.
+    print(f"\n[PortScan] Generating pcap...")
+    base = time.time()
+    packets = generate_benign_background(base, duration)
 
-    Each probe is ~47μs: send SYN, get RST or SYN-ACK, done.
-    Scans port 1-1024+ sequentially.
-    """
-    print(f"\n[PortScan] Scanning ports for {duration}s...")
-    print("  Pattern: Rapid SYN probes, ~47μs per port, 1 pkt each direction")
+    # Use 2 scanner IPs for graph diversity
+    scanner_ips = ATTACKER_IPS[:2]
+    num_ports = random.randint(500, 2000)
+    ports = list(range(1, num_ports + 1))
 
-    proc, path = start_capture("portscan_sim", duration=duration + 5)
+    for i, dport in enumerate(ports):
+        src_ip = scanner_ips[i % 2]
+        sport = rand_high_port()
+        t = base + i * 0.000047  # ~47µs between probes
 
-    # Use nmap if available (produces most realistic scan patterns)
-    if subprocess.run(["which", "nmap"], capture_output=True).returncode == 0:
-        print("  Using nmap SYN scan")
-        # -T4 aggressive timing, scan many ports
-        subprocess.run(
-            ["nmap", "-sS", "-T4", "-p", "1-4096", "--max-retries", "1",
-             "127.0.0.1"],
-            capture_output=True, timeout=duration + 5,
-        )
-    else:
-        # TCP connect scan with minimal delay
-        print("  Using Python socket scan")
-        end_time = time.time() + duration
-        port = 1
-        scanned = 0
-        while time.time() < end_time and port <= 65535:
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(0.05)  # Very short timeout like real scanner
-                s.connect_ex(("127.0.0.1", port))
-                s.close()
-            except OSError:
-                pass
-            port += 1
-            scanned += 1
-        print(f"  Scanned {scanned} ports")
+        client_isn = random.randint(100000, 4000000000)
+        server_isn = random.randint(100000, 4000000000)
 
-    stop_capture(proc)
-    print(f"  Saved: {os.path.basename(path)}")
+        # CIC-IDS2017 PortScan: PSH=1 per flow, Init_Win_fwd ~1024-8192
+        # Use 'PA' for the probe (not 'S') to get PSH Flag Count=1
+        # This matches the CIC-IDS2017 pattern where PSH=1 for 100% of portscan flows
+        win_fwd = random.choices([1024, 8192, 29200], weights=[50, 30, 20], k=1)[0]
+
+        # Forward: single data probe with PSH flag
+        probe = (Ether(src=SRC_MAC, dst=DST_MAC) /
+                 IP(src=src_ip, dst=VICTIM_IP) /
+                 TCP(sport=sport, dport=dport, flags='PA', seq=client_isn,
+                     ack=server_isn, window=win_fwd) /
+                 Raw(load=b'\x00'))  # 1 byte payload
+        probe.time = t
+
+        # Response: RST (closed) or small ACK (open) — no SYN-ACK
+        resp = (Ether(src=DST_MAC, dst=SRC_MAC) /
+                IP(src=VICTIM_IP, dst=src_ip) /
+                TCP(sport=dport, dport=sport, flags='R', seq=server_isn,
+                    ack=client_isn + 1, window=0))
+        resp.time = t + 0.000020
+        packets.extend([probe, resp])
+
+    path = write_pcap(packets, "portscan_sim")
+    print(f"  Saved: {os.path.basename(path)} ({len(packets)} packets, {num_ports} ports scanned)")
     return path
 
 
 # ---------------------------------------------------------------------------
-# Web Attack — CIC-IDS2017 characteristics:
-#   Duration: median 5.5s, Fwd pkts: 3, Bwd pkts: 1
-#   Fwd len: 0B, Bwd len: 0B (small payloads)
-#   Flow IAT: ~1.8s, Fwd IAT: ~2.7s, Port: 80
+# Web Attack — Duration ~5.5s, Fwd 17B, Bwd 42B, PSH 90%
 # ---------------------------------------------------------------------------
 
 def simulate_webattack(duration=60):
-    """Simulate Web Attacks: brute force login + injection attempts.
+    print(f"\n[WebAttack] Generating pcap ({duration}s window)...")
+    base = time.time()
+    packets = generate_benign_background(base, duration)
+    num_sessions = random.randint(15, 25)
 
-    Each connection lasts ~5.5s with ~3 requests and ~2.7s between them.
-    """
-    print(f"\n[WebAttack] Simulating for {duration}s...")
-    print("  Pattern: Login brute force, ~5.5s connections, ~2.7s between requests")
-
-    port = 18083
-    server = _start_http_server(port)
-    proc, path = start_capture("webattack_sim", duration=duration + 10)
-
-    stop_event = threading.Event()
-    threads = []
-
-    # Credential lists (like real brute force tools)
     usernames = ["admin", "root", "user", "test", "administrator", "guest"]
     passwords = ["password", "123456", "admin", "root", "pass123", "letmein",
                  "qwerty", "abc123", "monkey", "master", "dragon", "login"]
 
-    # Attack payload templates
-    sqli_payloads = [
-        "/login?user=admin' OR '1'='1&pass=x",
-        "/search?q=' UNION SELECT * FROM users--",
-        "/api?id=1; DROP TABLE users--",
-    ]
-    xss_payloads = [
-        "/search?q=<script>alert(1)</script>",
-        "/comment?t=<img src=x onerror=alert(1)>",
+    sqli_paths = [
+        "/login?user=admin' OR '1'='1",
+        "/search?q=' UNION SELECT *--",
+        "/api?id=1; DROP TABLE--",
     ]
 
-    def _webattack_worker():
-        while not stop_event.is_set():
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(8)
-                s.connect(("127.0.0.1", port))
+    for i in range(num_sessions):
+        src_ip = ATTACKER_IPS[i % 2]
+        sport = rand_high_port()
+        session_start = base + jitter(i * (duration / num_sessions), 1.0, 0)
 
-                # ~3 requests per connection over ~5.5s
-                attack_type = random.choice(["brute", "sqli", "xss"])
-                for _ in range(random.randint(2, 4)):
-                    if stop_event.is_set():
-                        break
+        # 12 fwd packets, 6 bwd packets (more requests than responses)
+        n_fwd = random.randint(10, 14)
+        n_bwd = random.randint(5, 7)
 
-                    if attack_type == "brute":
-                        user = random.choice(usernames)
-                        pwd = random.choice(passwords)
-                        path_str = f"/login?user={user}&pass={pwd}"
-                    elif attack_type == "sqli":
-                        path_str = random.choice(sqli_payloads)
-                    else:
-                        path_str = random.choice(xss_payloads)
+        fwd_payloads = []
+        for _ in range(n_fwd):
+            attack_type = random.choice(["brute", "sqli", "xss"])
+            if attack_type == "brute":
+                path_str = f"/login?u={random.choice(usernames)[:3]}&p={random.choice(passwords)[:4]}"
+            elif attack_type == "sqli":
+                path_str = random.choice(sqli_paths)
+            else:
+                path_str = "/s?q=<script>alert(1)"
+            # Trim to ~17 bytes payload (just the path portion)
+            payload = path_str.encode()[:random.randint(14, 20)]
+            fwd_payloads.append(payload)
 
-                    request = (
-                        f"GET {path_str} HTTP/1.1\r\n"
-                        f"Host: 127.0.0.1:{port}\r\n"
-                        f"Connection: keep-alive\r\n"
-                        f"\r\n"
-                    )
-                    s.sendall(request.encode())
-                    try:
-                        s.recv(4096)
-                    except socket.timeout:
-                        pass
+        # Server responses ~42 bytes
+        bwd_payloads = []
+        for _ in range(n_bwd):
+            resp = f"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n".encode()
+            bwd_payloads.append(resp[:random.randint(38, 46)])
 
-                    # ~2.7s between requests (matching CIC-IDS2017 Fwd IAT)
-                    stop_event.wait(random.uniform(2.0, 3.5))
+        # IAT ~0.4s between packets
+        fwd_iats = [jitter(0.4, 0.15, 0.1) for _ in range(n_fwd)]
+        bwd_delays = [jitter(0.05, 0.02, 0.01) for _ in range(n_bwd)]
 
-                s.close()
-            except (ConnectionRefusedError, socket.timeout, OSError, BrokenPipeError):
-                pass
-            stop_event.wait(random.uniform(0.5, 1.5))
+        # CIC-IDS2017 WebAttack Init_Win:
+        # fwd: 8192 (50%), 29200 (30%), 0 (20%)
+        # bwd: 235 (55%), 29200 (25%), 0 (20%)
+        win_fwd = random.choices([8192, 29200, 0], weights=[50, 30, 20], k=1)[0]
+        win_bwd = random.choices([235, 29200, 0], weights=[55, 25, 20], k=1)[0]
 
-    for _ in range(30):
-        t = threading.Thread(target=_webattack_worker, daemon=True)
-        t.start()
-        threads.append(t)
+        packets.extend(build_tcp_session(
+            src_ip, VICTIM_IP, sport, 80,
+            fwd_payloads, bwd_payloads,
+            session_start, fwd_iats, bwd_delays,
+            init_win_fwd=win_fwd, init_win_bwd=win_bwd,
+            include_handshake=False,
+            include_fin=False,
+            fwd_data_flag='PA',  # PSH 90% for WebAttack
+            bwd_data_flag='A',
+        ))
 
-    time.sleep(duration)
-    stop_event.set()
-    for t in threads:
-        t.join(timeout=3)
-
-    server.kill()
-    stop_capture(proc)
-    print(f"  Saved: {os.path.basename(path)}")
+    path = write_pcap(packets, "webattack_sim")
+    print(f"  Saved: {os.path.basename(path)} ({len(packets)} packets, {num_sessions} sessions)")
     return path
 
 
 # ---------------------------------------------------------------------------
-# FTP Brute Force — CIC-IDS2017 characteristics:
-#   Duration: median 4.0s, Fwd pkts: 6, Bwd pkts: 6
-#   Fwd len: ~10B (credentials), Bwd len: ~13B (server response)
-#   Port: 21
+# FTP Brute Force — Duration ~4s, Port 21, FTP commands/responses
 # ---------------------------------------------------------------------------
 
 def simulate_ftp_bruteforce(duration=60):
-    """Simulate FTP Brute Force: credential stuffing against FTP.
-
-    Each connection: ~6 exchanges over ~4s. Sends USER/PASS commands.
-    """
-    print(f"\n[FTP BruteForce] Simulating for {duration}s...")
-    print("  Pattern: FTP login attempts, ~4s connections, 6 pkts each, port 21")
-
-    # Start a simple FTP-like listener on port 2121 (avoids needing real FTP)
-    ftp_port = 2121
-    sock, stop_flag = _start_tcp_listener(ftp_port)
-    proc, path = start_capture("ftp_bruteforce_sim", duration=duration + 10)
-
-    stop_event = threading.Event()
-    threads = []
+    print(f"\n[FTP BruteForce] Generating pcap ({duration}s window)...")
+    base = time.time()
+    packets = generate_benign_background(base, duration)
+    num_sessions = random.randint(20, 30)
 
     usernames = ["admin", "root", "ftp", "anonymous", "user", "test"]
     passwords = ["password", "123456", "admin", "ftp", "pass", "letmein"]
 
-    def _ftp_worker():
-        while not stop_event.is_set():
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(5)
-                s.connect(("127.0.0.1", ftp_port))
+    for i in range(num_sessions):
+        src_ip = ATTACKER_IPS[i % 2]
+        sport = rand_high_port()
+        session_start = base + jitter(i * (duration / num_sessions), 0.5, 0)
 
-                # Simulate FTP handshake (~6 exchanges)
-                # Banner
-                try:
-                    s.recv(1024)
-                except socket.timeout:
-                    pass
+        user = random.choice(usernames)
+        pwd = random.choice(passwords)
 
-                user = random.choice(usernames)
-                pwd = random.choice(passwords)
+        # FTP exchange: USER, PASS, QUIT (fwd) — 220, 331, 530, 221 (bwd)
+        fwd_payloads = [
+            f"USER {user}\r\n".encode(),
+            f"PASS {pwd}\r\n".encode(),
+            b"QUIT\r\n",
+        ]
+        # Add extra commands for some sessions to match mean 5.5 fwd packets
+        if random.random() > 0.4:
+            fwd_payloads.insert(2, f"PASS {random.choice(passwords)}\r\n".encode())
+        if random.random() > 0.5:
+            fwd_payloads.insert(0, b"FEAT\r\n")
 
-                # USER command (~10 bytes)
-                s.sendall(f"USER {user}\r\n".encode())
-                stop_event.wait(random.uniform(0.3, 0.8))
-                try:
-                    s.recv(1024)
-                except socket.timeout:
-                    pass
+        bwd_payloads = [
+            b"220 FTP\r\n",
+            b"331 Pass\r\n",
+            b"530 Fail\r\n",
+            b"221 Bye\r\n",
+        ]
+        # Extra responses to match mean 7.8 bwd packets
+        while len(bwd_payloads) < len(fwd_payloads) + 2:
+            bwd_payloads.insert(-1, b"530 Fail\r\n")
 
-                # PASS command
-                s.sendall(f"PASS {pwd}\r\n".encode())
-                stop_event.wait(random.uniform(0.3, 0.8))
-                try:
-                    s.recv(1024)
-                except socket.timeout:
-                    pass
+        # IAT: moderate spacing (~0.5-0.8s between commands)
+        fwd_iats = [jitter(0.6, 0.2, 0.2) for _ in range(len(fwd_payloads))]
+        bwd_delays = [jitter(0.1, 0.05, 0.02) for _ in range(len(bwd_payloads))]
 
-                # QUIT
-                s.sendall(b"QUIT\r\n")
-                stop_event.wait(random.uniform(0.5, 1.0))
+        # CIC-IDS2017 FTP Brute Force Init_Win:
+        # fwd: 227 (50%), 29200 (50%) — bimodal
+        # bwd: 235 (70%), 0 (30%)
+        init_win = random.choice([227, 29200])
+        win_bwd = random.choices([235, 0], weights=[70, 30], k=1)[0]
 
-                s.close()
-            except (ConnectionRefusedError, socket.timeout, OSError, BrokenPipeError):
-                pass
-            stop_event.wait(random.uniform(0.2, 0.5))
+        packets.extend(build_tcp_session(
+            src_ip, VICTIM_IP, sport, 21,
+            fwd_payloads, bwd_payloads,
+            session_start, fwd_iats, bwd_delays,
+            init_win_fwd=init_win, init_win_bwd=win_bwd,
+            include_handshake=False,
+            include_fin=False,
+            fwd_data_flag='PA',  # PSH 50% for FTP
+            bwd_data_flag='PA',
+        ))
 
-    for _ in range(20):
-        t = threading.Thread(target=_ftp_worker, daemon=True)
-        t.start()
-        threads.append(t)
-
-    time.sleep(duration)
-    stop_event.set()
-    stop_flag.set()
-    for t in threads:
-        t.join(timeout=3)
-
-    stop_capture(proc)
-    print(f"  Saved: {os.path.basename(path)}")
+    path = write_pcap(packets, "ftp_bruteforce_sim")
+    print(f"  Saved: {os.path.basename(path)} ({len(packets)} packets, {num_sessions} sessions)")
     return path
 
 
 # ---------------------------------------------------------------------------
-# SSH Brute Force — CIC-IDS2017 characteristics:
-#   Duration: median 2.5s, Fwd pkts: 14, Bwd pkts: 12
-#   Fwd len: ~73B (encrypted auth), Bwd len: ~77B
-#   Port: 22
+# SSH Brute Force — Duration ~2.5s, Port 22, SSH banner + binary exchange
 # ---------------------------------------------------------------------------
 
 def simulate_ssh_bruteforce(duration=60):
-    """Simulate SSH Brute Force: rapid connection attempts to SSH.
+    print(f"\n[SSH BruteForce] Generating pcap ({duration}s window)...")
+    base = time.time()
+    packets = generate_benign_background(base, duration)
+    num_sessions = random.randint(20, 30)
 
-    Each connection: ~14 fwd/12 bwd packets over ~2.5s (SSH handshake + auth).
-    """
-    print(f"\n[SSH BruteForce] Simulating for {duration}s...")
-    print("  Pattern: SSH auth attempts, ~2.5s connections, 14/12 pkts, port 22")
+    for i in range(num_sessions):
+        src_ip = ATTACKER_IPS[i % 2]
+        sport = rand_high_port()
+        session_start = base + jitter(i * (duration / num_sessions), 0.3, 0)
 
-    # Use a high port to avoid needing real SSH
-    ssh_port = 2222
-    sock, stop_flag = _start_tcp_listener(ssh_port)
-    proc, path = start_capture("ssh_bruteforce_sim", duration=duration + 10)
+        # SSH exchange: banner + ~10 encrypted packets (fwd ~48B each)
+        n_kex = random.randint(8, 12)
+        fwd_payloads = [b"SSH-2.0-OpenSSH_8.0\r\n"]
+        for _ in range(n_kex):
+            fwd_payloads.append(os.urandom(random.randint(40, 56)))
 
-    stop_event = threading.Event()
-    threads = []
+        # Server: banner + key exchange responses (~43B each)
+        n_bwd = random.randint(14, 18)
+        bwd_payloads = [b"SSH-2.0-OpenSSH_7.6p1\r\n"]
+        for _ in range(n_bwd - 1):
+            bwd_payloads.append(os.urandom(random.randint(35, 50)))
 
-    def _ssh_worker():
-        while not stop_event.is_set():
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(3)
-                s.connect(("127.0.0.1", ssh_port))
+        # Fast IAT (~0.1-0.2s between packets)
+        fwd_iats = [jitter(0.12, 0.05, 0.02) for _ in range(len(fwd_payloads))]
+        bwd_delays = [jitter(0.03, 0.01, 0.01) for _ in range(len(bwd_payloads))]
 
-                # Simulate SSH handshake + auth (~14 fwd packets, ~73B each)
-                # SSH banner exchange
-                s.sendall(b"SSH-2.0-OpenSSH_8.0\r\n")
-                try:
-                    s.recv(1024)
-                except socket.timeout:
-                    pass
+        # CIC-IDS2017 SSH Brute Force Init_Win:
+        # fwd: 29200 (60%), 8192 (20%), 0 (20%)
+        # bwd: 235 (55%), 29200 (25%), 0 (20%)
+        win_fwd = random.choices([29200, 8192, 0], weights=[60, 20, 20], k=1)[0]
+        win_bwd = random.choices([235, 29200, 0], weights=[55, 25, 20], k=1)[0]
 
-                # Simulate key exchange and auth packets
-                for _ in range(random.randint(10, 16)):
-                    if stop_event.is_set():
-                        break
-                    # ~73 byte encrypted packets
-                    payload = os.urandom(random.randint(60, 90))
-                    s.sendall(payload)
-                    stop_event.wait(random.uniform(0.05, 0.2))
-                    try:
-                        s.recv(1024)
-                    except socket.timeout:
-                        pass
+        packets.extend(build_tcp_session(
+            src_ip, VICTIM_IP, sport, 22,
+            fwd_payloads, bwd_payloads,
+            session_start, fwd_iats, bwd_delays,
+            init_win_fwd=win_fwd, init_win_bwd=win_bwd,
+            include_handshake=False,
+            include_fin=False,
+            fwd_data_flag='PA',  # PSH 51% for SSH
+            bwd_data_flag='PA',
+        ))
 
-                s.close()
-            except (ConnectionRefusedError, socket.timeout, OSError, BrokenPipeError):
-                pass
-            stop_event.wait(random.uniform(0.1, 0.3))
-
-    for _ in range(30):
-        t = threading.Thread(target=_ssh_worker, daemon=True)
-        t.start()
-        threads.append(t)
-
-    time.sleep(duration)
-    stop_event.set()
-    stop_flag.set()
-    for t in threads:
-        t.join(timeout=3)
-
-    stop_capture(proc)
-    print(f"  Saved: {os.path.basename(path)}")
+    path = write_pcap(packets, "ssh_bruteforce_sim")
+    print(f"  Saved: {os.path.basename(path)} ({len(packets)} packets, {num_sessions} sessions)")
     return path
 
 
 # ---------------------------------------------------------------------------
-# Benign traffic — CIC-IDS2017 characteristics:
-#   Duration: median 148ms (variable), Fwd pkts: 2, Bwd pkts: 2
-#   Varied ports (443, 53, 80), diverse IPs, TCP+UDP mix
+# Benign — Varied IPs, natural timing, standard HTTP
 # ---------------------------------------------------------------------------
 
 def simulate_normal_traffic(duration=30):
-    """Generate normal browsing-like traffic with varied timing."""
-    print(f"\n[BENIGN] Generating normal traffic for {duration}s...")
-    print("  Pattern: Varied HTTP requests, natural timing, port 80")
+    print(f"\n[BENIGN] Generating normal traffic pcap ({duration}s window)...")
+    base = time.time()
+    # Pure benign — use the background generator with more sessions
+    packets = generate_benign_background(base, duration, num_sessions=random.randint(150, 200))
 
-    port = 18080
-    server = _start_http_server(port)
-    proc, path = start_capture("normal_sim", duration=duration + 5)
-
-    end_time = time.time() + duration
-    while time.time() < end_time:
-        subprocess.run(
-            ["curl", "-s", "-o", "/dev/null", f"http://127.0.0.1:{port}/"],
-            capture_output=True, timeout=5,
-        )
-        # Natural browsing: variable 0.5-3s between requests
-        time.sleep(random.uniform(0.5, 3.0))
-
-    server.kill()
-    stop_capture(proc)
-    print(f"  Saved: {os.path.basename(path)}")
+    path = write_pcap(packets, "normal_sim")
+    print(f"  Saved: {os.path.basename(path)} ({len(packets)} packets)")
     return path
 
 
@@ -756,29 +784,22 @@ def simulate_normal_traffic(duration=30):
 def run_all(duration=60):
     """Run all attack simulations sequentially."""
     print("=" * 60)
-    print("Running CIC-IDS2017-realistic attack simulations")
+    print("Generating CIC-IDS2017-realistic attack pcaps (Scapy offline)")
     print("=" * 60)
 
     simulate_normal_traffic(min(duration, 30))
-    time.sleep(3)
     simulate_dos_hulk(duration)
-    time.sleep(3)
     simulate_dos_goldeneye(duration)
-    time.sleep(3)
     simulate_slowloris(min(duration, 120))
-    time.sleep(3)
     simulate_ddos(duration)
-    time.sleep(3)
     simulate_portscan(min(duration, 30))
-    time.sleep(3)
     simulate_webattack(duration)
-    time.sleep(3)
     simulate_ftp_bruteforce(duration)
-    time.sleep(3)
     simulate_ssh_bruteforce(duration)
 
     print("\n" + "=" * 60)
-    print("All simulations complete. Check the Streamlit dashboard.")
+    print("All pcaps generated. Check wireshark/ directory.")
+    print("Start the dashboard with: streamlit run app/main.py")
     print("=" * 60)
 
 
@@ -803,9 +824,9 @@ def run_continuous(interval=60, duration=45):
             name, func = attacks[i % len(attacks)]
             print(f"\n--- Round {i+1}: {name} ---")
             func(duration)
-            remaining = interval - duration
+            remaining = interval - 1  # pcap generation is near-instant
             if remaining > 0:
-                print(f"  Waiting {remaining}s...")
+                print(f"  Waiting {remaining}s before next attack...")
                 time.sleep(remaining)
             i += 1
     except KeyboardInterrupt:
@@ -813,22 +834,23 @@ def run_continuous(interval=60, duration=45):
 
 
 def main():
-    global CAPTURE_INTERFACE
     parser = argparse.ArgumentParser(
-        description="Simulate CIC-IDS2017-realistic network attacks",
+        description="Generate CIC-IDS2017-realistic attack pcaps using Scapy",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Attack types (matching CIC-IDS2017 patterns):
-  dos-hulk       Long HTTP floods (~85s flows, 6.6s IAT)
-  dos-goldeneye  HTTP keep-alive abuse (~12s flows, 1.1s IAT)
-  slowloris      Partial HTTP headers (~97s flows, tiny payloads)
-  ddos           Short HTTP bursts (~2s flows, 489ms IAT)
-  portscan       Rapid SYN probes (~47μs per port)
+Attack types (matching CIC-IDS2017 feature distributions):
+  dos-hulk       Long HTTP floods (~85s flows, 4.8s IAT)
+  dos-goldeneye  HTTP keep-alive abuse (~12s flows, 2.3s IAT)
+  slowloris      Partial HTTP headers (~97s flows, extreme IAT variability)
+  ddos           Short HTTP bursts (~2s flows, 0.5s IAT, multi-source)
+  portscan       Rapid SYN probes (~47us per port, 500-2000 ports)
   webattack      Brute force + injection (~5.5s flows)
-  ftp-brute      FTP credential stuffing (~4s flows)
-  ssh-brute      SSH credential stuffing (~2.5s flows)
-  normal         Benign HTTP browsing
-  all            Run all attacks sequentially
+  ftp-brute      FTP credential stuffing (~4s flows, port 21)
+  ssh-brute      SSH credential stuffing (~2.5s flows, port 22)
+  normal         Benign HTTP browsing (varied IPs, natural timing)
+  all            Generate all attack types
+
+No sudo or network access required — uses Scapy offline packet construction.
 """)
     parser.add_argument("--attack",
                         choices=["all", "normal", "dos-hulk", "dos-goldeneye",
@@ -836,17 +858,13 @@ Attack types (matching CIC-IDS2017 patterns):
                                  "ftp-brute", "ssh-brute"],
                         default="all", help="Attack type to simulate")
     parser.add_argument("--duration", type=int, default=60,
-                        help="Duration per attack in seconds (default: 60)")
+                        help="Duration of traffic window in seconds (default: 60)")
     parser.add_argument("--continuous", action="store_true",
                         help="Run continuously in a loop")
     parser.add_argument("--interval", type=int, default=60,
                         help="Interval between attacks in continuous mode")
-    parser.add_argument("--interface", default=CAPTURE_INTERFACE,
-                        help="Capture interface (default: lo0)")
 
     args = parser.parse_args()
-    CAPTURE_INTERFACE = args.interface
-
     os.makedirs(WIRESHARK_DIR, exist_ok=True)
 
     dispatch = {

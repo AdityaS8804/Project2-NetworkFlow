@@ -4,9 +4,9 @@ import plotly.express as px
 import networkx as nx
 from collections import Counter
 
-from .config import ID_TO_ATTACK
+from .config import ID_TO_ATTACK, ATTACK_LABEL_MAP
 
-# Color palette for attack types
+# Color palette for attack types (by class ID)
 ATTACK_COLORS = {
     0: '#2ecc71',   # Benign - green
     1: '#e74c3c',   # DoS - red
@@ -17,27 +17,102 @@ ATTACK_COLORS = {
     6: '#1abc9c',   # Bot/Other - teal
 }
 
+# Color palette by ground truth label string
+GT_COLORS = {
+    'Benign': '#2ecc71',
+    'Unknown': '#bdc3c7',
+    'DoS': '#e74c3c',
+    'DDoS': '#c0392b',
+    'PortScan': '#3498db',
+    'BruteForce': '#f39c12',
+    'WebAttack': '#9b59b6',
+    'Bot/Other': '#1abc9c',
+}
 
-def build_embedding_scatter(records, coords, method="PCA"):
-    """Plotly scatter plot of 2D embedding coordinates colored by predicted attack type."""
+
+def _gt_color(label):
+    """Get color for a ground truth label string."""
+    if label in GT_COLORS:
+        return GT_COLORS[label]
+    # Try mapping through ATTACK_LABEL_MAP → ID_TO_ATTACK
+    cls_id = ATTACK_LABEL_MAP.get(label, -1)
+    if cls_id >= 0:
+        mapped = ID_TO_ATTACK.get(cls_id, label)
+        return GT_COLORS.get(mapped, '#95a5a6')
+    return '#95a5a6'
+
+
+def _normalize_gt(label):
+    """Normalize ground truth label to display name."""
+    if label in ('Benign', 'Unknown'):
+        return label
+    cls_id = ATTACK_LABEL_MAP.get(label, -1)
+    if cls_id >= 0:
+        return ID_TO_ATTACK.get(cls_id, label)
+    return label
+
+
+# ── Embedding scatter (ground truth colors) ──────────────────
+
+def build_embedding_scatter_gt(records, coords, method="PCA"):
+    """Scatter plot of embeddings colored by GROUND TRUTH label."""
     if coords is None or len(records) == 0:
         return go.Figure().add_annotation(text="Not enough data yet", showarrow=False)
 
-    labels = [r.attack_pred for r in records]
-    colors = [ATTACK_COLORS.get(l, '#95a5a6') for l in labels]
-    names = [ID_TO_ATTACK.get(l, f"Class {l}") for l in labels]
+    gt_labels = [_normalize_gt(r.ground_truth_label) for r in records]
+
     hover_text = [
-        f"Type: {ID_TO_ATTACK.get(r.attack_pred, '?')}<br>"
-        f"GT: {r.ground_truth_label}<br>"
+        f"GT: {gt}<br>"
         f"Nodes: {r.metadata.get('num_nodes', '?')}<br>"
         f"Edges: {r.metadata.get('num_edges', '?')}<br>"
-        f"Confidence: {r.attack_probs[r.attack_pred]:.1%}"
-        for r in records
+        f"Flows: {r.metadata.get('num_flows', '?')}"
+        for r, gt in zip(records, gt_labels)
     ]
 
     fig = go.Figure()
 
-    # Group by attack type for legend
+    for label in sorted(set(gt_labels), key=lambda x: (x != 'Benign', x)):
+        mask = [i for i, l in enumerate(gt_labels) if l == label]
+        fig.add_trace(go.Scatter(
+            x=coords[mask, 0],
+            y=coords[mask, 1],
+            mode='markers',
+            marker=dict(
+                size=10,
+                color=_gt_color(label),
+                line=dict(width=0.5, color='black'),
+            ),
+            name=f"{label} ({len(mask)})",
+            text=[hover_text[i] for i in mask],
+            hoverinfo='text',
+        ))
+
+    fig.update_layout(
+        title=f"{method} of GNN Graph Embeddings",
+        xaxis_title=f"{method} 1",
+        yaxis_title=f"{method} 2",
+        height=500,
+        legend=dict(orientation="h", yanchor="bottom", y=-0.2),
+        margin=dict(t=40, b=80),
+    )
+    return fig
+
+
+def build_embedding_scatter(records, coords, method="PCA"):
+    """Scatter plot of embeddings colored by predicted attack type."""
+    if coords is None or len(records) == 0:
+        return go.Figure().add_annotation(text="Not enough data yet", showarrow=False)
+
+    labels = [r.attack_pred for r in records]
+    hover_text = [
+        f"Pred: {ID_TO_ATTACK.get(r.attack_pred, '?')}<br>"
+        f"GT: {r.ground_truth_label}<br>"
+        f"Nodes: {r.metadata.get('num_nodes', '?')}<br>"
+        f"Edges: {r.metadata.get('num_edges', '?')}"
+        for r in records
+    ]
+
+    fig = go.Figure()
     for cls_id in sorted(set(labels)):
         mask = [i for i, l in enumerate(labels) if l == cls_id]
         fig.add_trace(go.Scatter(
@@ -52,7 +127,7 @@ def build_embedding_scatter(records, coords, method="PCA"):
         ))
 
     fig.update_layout(
-        title=f"{method} of Graph Embeddings by Attack Type",
+        title=f"{method} of Graph Embeddings (Model Predictions)",
         xaxis_title=f"{method} 1",
         yaxis_title=f"{method} 2",
         height=500,
@@ -62,15 +137,134 @@ def build_embedding_scatter(records, coords, method="PCA"):
     return fig
 
 
+# ── Ground truth distribution charts ─────────────────────────
+
+def build_gt_pie(records):
+    """Pie chart of ground truth label distribution."""
+    if not records:
+        return go.Figure().add_annotation(text="No data yet", showarrow=False)
+
+    gt_labels = [_normalize_gt(r.ground_truth_label) for r in records]
+    counts = Counter(gt_labels)
+
+    names = list(counts.keys())
+    values = list(counts.values())
+    colors = [_gt_color(n) for n in names]
+
+    fig = go.Figure(data=[go.Pie(
+        labels=names, values=values,
+        marker=dict(colors=colors),
+        textinfo='label+percent',
+        hoverinfo='label+value',
+    )])
+    fig.update_layout(
+        title="Traffic Type Distribution (Ground Truth)",
+        height=350,
+        margin=dict(t=40),
+    )
+    return fig
+
+
+def build_gt_timeline(records):
+    """Stacked bar chart of ground truth labels over time windows."""
+    if not records:
+        return go.Figure().add_annotation(text="No data yet", showarrow=False)
+
+    timestamps = [r.metadata.get('window_start_ts', str(r.timestamp)) for r in records]
+    gt_labels = [_normalize_gt(r.ground_truth_label) for r in records]
+
+    time_groups = {}
+    for t, l in zip(timestamps, gt_labels):
+        if t not in time_groups:
+            time_groups[t] = Counter()
+        time_groups[t][l] += 1
+
+    sorted_times = sorted(time_groups.keys())
+
+    fig = go.Figure()
+    for label in sorted(set(gt_labels), key=lambda x: (x != 'Benign', x)):
+        counts = [time_groups[t].get(label, 0) for t in sorted_times]
+        fig.add_trace(go.Bar(
+            x=sorted_times,
+            y=counts,
+            name=label,
+            marker_color=_gt_color(label),
+        ))
+
+    fig.update_layout(
+        barmode='stack',
+        title="Traffic Types Over Time (Ground Truth)",
+        xaxis_title="Window",
+        yaxis_title="Count",
+        height=400,
+        legend=dict(orientation="h", yanchor="bottom", y=-0.3),
+        margin=dict(t=40, b=80),
+    )
+    return fig
+
+
+# ── Graph structure scatter ──────────────────────────────────
+
+def build_graph_stats_scatter(records):
+    """Scatter plot of graph structural properties colored by GT label."""
+    if not records:
+        return go.Figure().add_annotation(text="No data yet", showarrow=False)
+
+    nodes = []
+    edges = []
+    densities = []
+    gt_labels = []
+
+    for r in records:
+        G = r.nx_graph
+        n = G.number_of_nodes()
+        e = G.number_of_edges()
+        nodes.append(n)
+        edges.append(e)
+        densities.append(nx.density(G) if n > 1 else 0)
+        gt_labels.append(_normalize_gt(r.ground_truth_label))
+
+    fig = go.Figure()
+    for label in sorted(set(gt_labels), key=lambda x: (x != 'Benign', x)):
+        mask = [i for i, l in enumerate(gt_labels) if l == label]
+        fig.add_trace(go.Scatter(
+            x=[nodes[i] for i in mask],
+            y=[edges[i] for i in mask],
+            mode='markers',
+            marker=dict(
+                size=[max(8, densities[i] * 100) for i in mask],
+                color=_gt_color(label),
+                line=dict(width=0.5, color='black'),
+                opacity=0.7,
+            ),
+            name=f"{label} ({len(mask)})",
+            text=[f"GT: {gt_labels[i]}<br>Nodes: {nodes[i]}<br>"
+                  f"Edges: {edges[i]}<br>Density: {densities[i]:.4f}"
+                  for i in mask],
+            hoverinfo='text',
+        ))
+
+    fig.update_layout(
+        title="Graph Structure: Nodes vs Edges (size = density)",
+        xaxis_title="Number of Nodes (IPs)",
+        yaxis_title="Number of Edges (Flows)",
+        height=400,
+        legend=dict(orientation="h", yanchor="bottom", y=-0.2),
+        margin=dict(t=40, b=80),
+    )
+    return fig
+
+
+# ── Legacy charts (kept for compatibility) ───────────────────
+
 def build_attack_timeline(records):
-    """Stacked bar chart of attack types over time windows."""
+    """Stacked bar chart of attack types over time windows (model predictions)."""
     if not records:
         return go.Figure().add_annotation(text="No data yet", showarrow=False)
 
     timestamps = [r.metadata.get('window_start_ts', str(r.timestamp)) for r in records]
     labels = [r.attack_pred for r in records]
 
-    # Group by timestamp
     time_groups = {}
     for t, l in zip(timestamps, labels):
         if t not in time_groups:
@@ -91,7 +285,7 @@ def build_attack_timeline(records):
 
     fig.update_layout(
         barmode='stack',
-        title="Attack Distribution Over Time",
+        title="Attack Distribution Over Time (Predictions)",
         xaxis_title="Window",
         yaxis_title="Count",
         height=400,
@@ -102,13 +296,12 @@ def build_attack_timeline(records):
 
 
 def build_attack_pie(records):
-    """Pie chart of attack class distribution."""
+    """Pie chart of predicted attack class distribution."""
     if not records:
         return go.Figure().add_annotation(text="No data yet", showarrow=False)
 
     labels = [r.attack_pred for r in records]
     counts = Counter(labels)
-
     names = [ID_TO_ATTACK.get(k, f"Class {k}") for k in counts.keys()]
     values = list(counts.values())
     colors = [ATTACK_COLORS.get(k, '#95a5a6') for k in counts.keys()]
@@ -119,9 +312,11 @@ def build_attack_pie(records):
         textinfo='label+percent',
         hoverinfo='label+value',
     )])
-    fig.update_layout(title="Attack Distribution", height=350, margin=dict(t=40))
+    fig.update_layout(title="Attack Distribution (Predictions)", height=350, margin=dict(t=40))
     return fig
 
+
+# ── Topology graph ───────────────────────────────────────────
 
 def build_topology_graph(nx_graph, node_labels=None, title="Network Topology"):
     """Plotly network graph visualization using spring layout."""
@@ -129,7 +324,7 @@ def build_topology_graph(nx_graph, node_labels=None, title="Network Topology"):
         return go.Figure().add_annotation(text="No graph data", showarrow=False)
 
     G = nx_graph
-    pos = nx.spring_layout(G, seed=42, k=2.0/np.sqrt(G.number_of_nodes()))
+    pos = nx.spring_layout(G, seed=42, k=2.0 / np.sqrt(G.number_of_nodes()))
 
     # Edges
     edge_x, edge_y = [], []
@@ -154,8 +349,6 @@ def build_topology_graph(nx_graph, node_labels=None, title="Network Topology"):
 
     for n in G.nodes():
         label = G.nodes[n].get('label', 'Unknown')
-        label_id = 0
-        from .config import ATTACK_LABEL_MAP
         label_id = ATTACK_LABEL_MAP.get(label, 0)
         node_colors.append(ATTACK_COLORS.get(label_id, '#95a5a6'))
 
@@ -191,15 +384,21 @@ def build_topology_graph(nx_graph, node_labels=None, title="Network Topology"):
     return fig
 
 
+# ── NL Query similarity bars ────────────────────────────────
+
 def build_similarity_bars(results):
     """Horizontal bar chart of NL query similarity scores."""
     if not results:
         return go.Figure().add_annotation(text="No results", showarrow=False)
 
-    labels = [f"#{i+1} {r['stats']['attack_name']} ({r['stats']['num_nodes']}n, {r['stats']['num_edges']}e)"
-              for i, r in enumerate(results)]
+    labels = [
+        f"#{i+1} GT:{r['record'].ground_truth_label} "
+        f"({r['stats']['num_nodes']}n, {r['stats']['num_edges']}e)"
+        for i, r in enumerate(results)
+    ]
     scores = [r['similarity'] for r in results]
-    colors = [ATTACK_COLORS.get(r['record'].attack_pred, '#95a5a6') for r in results]
+    gt_labels = [_normalize_gt(r['record'].ground_truth_label) for r in results]
+    colors = [_gt_color(l) for l in gt_labels]
 
     fig = go.Figure(go.Bar(
         x=scores,
@@ -210,10 +409,10 @@ def build_similarity_bars(results):
         textposition='auto',
     ))
     fig.update_layout(
-        title="Similarity Scores",
+        title="Retrieval Similarity Scores",
         xaxis_title="Cosine Similarity",
         height=max(200, 50 * len(results)),
-        margin=dict(t=40, l=200),
+        margin=dict(t=40, l=250),
         yaxis=dict(autorange="reversed"),
     )
     return fig

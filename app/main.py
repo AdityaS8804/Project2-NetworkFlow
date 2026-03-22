@@ -7,9 +7,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import streamlit as st
 import numpy as np
+import pandas as pd
 from collections import Counter
 
-from app.config import WATCH_DIR, REFRESH_INTERVAL_SEC, ID_TO_ATTACK
+from app.config import WATCH_DIR, REFRESH_INTERVAL_SEC, ID_TO_ATTACK, ATTACK_LABEL_MAP, META_COLS, LABEL_COL
 from app.state import AppState
 from app.pipeline import BackgroundPipeline
 from app.watcher import PcapWatcher
@@ -48,32 +49,38 @@ NL_QUERY_EXAMPLES = [
 
 @st.cache_resource
 def init_backend():
-    """Initialize backend (models, pipeline, watcher) once across all sessions."""
+    """Initialize backend (models, pipeline) once across all sessions."""
     state = AppState()
     pipeline = BackgroundPipeline(state)
     pipeline.initialize()
+    nl_engine = NLQueryEngine(pipeline.inference, state)
+    return state, pipeline, nl_engine
 
+
+@st.cache_resource
+def _get_watcher(_state, _pipeline):
+    """Create and start the PcapWatcher lazily, only when Live mode is used."""
     watcher = PcapWatcher(
         watch_dir=WATCH_DIR,
-        state=state,
-        pipeline=pipeline,
+        state=_state,
+        pipeline=_pipeline,
     )
     watcher.start()
-    watcher.pause()
-
-    nl_engine = NLQueryEngine(pipeline.inference, state)
-    return state, pipeline, watcher, nl_engine
+    return watcher
 
 
-def _switch_mode(state, pipeline, watcher, new_mode):
+def _switch_mode(state, pipeline, new_mode):
     """Clear all data and configure for the selected mode."""
     state.clear()
     pipeline.graph_builder.reset()
     if new_mode == "Live":
+        watcher = _get_watcher(state, pipeline)
         watcher.resume()
         state.set_status("Watching for files in wireshark/ ...")
     else:
-        watcher.pause()
+        if st.session_state.get("_watcher_started"):
+            watcher = _get_watcher(state, pipeline)
+            watcher.pause()
         state.set_status("Demo mode — select a dataset to load.")
 
 
@@ -84,7 +91,7 @@ def main():
         layout="wide",
     )
 
-    state, pipeline, watcher, nl_engine = init_backend()
+    state, pipeline, nl_engine = init_backend()
 
     # ── Sidebar ──────────────────────────────────────────────
     st.sidebar.title("GNN-BERT Network Analyzer")
@@ -93,7 +100,9 @@ def main():
     applied_mode = st.session_state.get("_applied_mode")
 
     if applied_mode != mode:
-        _switch_mode(state, pipeline, watcher, mode)
+        _switch_mode(state, pipeline, mode)
+        if mode == "Live":
+            st.session_state["_watcher_started"] = True
         st.session_state["_applied_mode"] = mode
         if applied_mode is not None:
             st.rerun()
@@ -117,7 +126,7 @@ def main():
     st.sidebar.markdown("---")
     page = st.sidebar.radio(
         "Navigation",
-        ["Embedding Explorer", "NL Query", "Graph Inspector", "Architecture"],
+        ["Embedding Explorer", "NL Query", "Graph Inspector"],
     )
     auto_refresh = st.sidebar.checkbox("Auto-refresh", value=(mode == "Live"))
 
@@ -127,8 +136,6 @@ def main():
         render_query_page(nl_engine, state, mode)
     elif page == "Graph Inspector":
         render_topology_page(state)
-    elif page == "Architecture":
-        render_architecture_page()
 
     if auto_refresh and page == "Embedding Explorer":
         time.sleep(REFRESH_INTERVAL_SEC)
@@ -140,18 +147,23 @@ def main():
 def _render_demo_controls(sb, state, pipeline):
     sb.subheader("Load CIC-IDS2017 Data")
 
-    demo_choice = sb.selectbox("Dataset:", list(DEMO_CSV_OPTIONS.keys()))
+    MIXED_OPTION = "Mixed Sample (All Datasets)"
+    demo_options = [MIXED_OPTION] + list(DEMO_CSV_OPTIONS.keys())
+    demo_choice = sb.selectbox("Dataset:", demo_options)
     demo_rows = sb.slider("Max rows to load", 5000, 100000, 30000, step=5000)
 
     col_load, col_clear = sb.columns(2)
     if col_load.button("Load", use_container_width=True):
-        csv_path, skip = DEMO_CSV_OPTIONS[demo_choice]
-        if os.path.exists(csv_path):
-            with st.spinner(f"Loading {demo_choice}..."):
-                pipeline.load_csv_data(csv_path, max_rows=demo_rows, skip_rows=skip)
-            sb.success(f"{state.get_record_count()} graphs loaded")
+        if demo_choice == MIXED_OPTION:
+            _load_mixed_sample(sb, state, pipeline, demo_rows)
         else:
-            sb.error(f"CSV not found: {csv_path}")
+            csv_path, skip = DEMO_CSV_OPTIONS[demo_choice]
+            if os.path.exists(csv_path):
+                with st.spinner(f"Loading {demo_choice}..."):
+                    pipeline.load_csv_data(csv_path, max_rows=demo_rows, skip_rows=skip)
+                sb.success(f"{state.get_record_count()} graphs loaded")
+            else:
+                sb.error(f"CSV not found: {csv_path}")
 
     if col_clear.button("Clear", use_container_width=True):
         state.clear()
@@ -162,6 +174,71 @@ def _render_demo_controls(sb, state, pipeline):
         "Loads pre-recorded CIC-IDS2017 network traffic into the "
         "GNN encoder and cross-attention bridge for analysis."
     )
+
+
+def _load_mixed_sample(sb, state, pipeline, total_rows):
+    """Stratified sample from all demo CSVs, ensuring attack types are represented."""
+    available = []
+    for name, (csv_path, skip) in DEMO_CSV_OPTIONS.items():
+        if os.path.exists(csv_path):
+            available.append((name, csv_path, skip))
+
+    if not available:
+        sb.error("No CSV files found.")
+        return
+
+    with st.spinner(f"Loading stratified sample from {len(available)} datasets..."):
+        # Read all CSVs
+        all_frames = []
+        for name, csv_path, skip in available:
+            skiprows = range(1, skip + 1) if skip > 0 else None
+            try:
+                df = pd.read_csv(csv_path, encoding='latin-1', skiprows=skiprows)
+            except UnicodeDecodeError:
+                df = pd.read_csv(csv_path, encoding='ISO-8859-1',
+                                 encoding_errors='replace', skiprows=skiprows)
+            df.columns = df.columns.str.strip()
+            all_frames.append(df)
+
+        full_df = pd.concat(all_frames, ignore_index=True)
+        full_df = full_df.replace([np.inf, -np.inf], np.nan)
+
+        # Stratified sampling: equal share per label, capped by availability
+        label_col = LABEL_COL if LABEL_COL in full_df.columns else None
+        if label_col:
+            labels = full_df[label_col].str.strip()
+            unique_labels = labels.unique()
+            rows_per_label = total_rows // len(unique_labels)
+
+            sampled = []
+            for lbl in unique_labels:
+                group = full_df[labels == lbl]
+                n = min(rows_per_label, len(group))
+                sampled.append(group.sample(n=n))
+
+            # Fill remaining budget with random rows from the full set
+            combined = pd.concat(sampled, ignore_index=True)
+            remaining = total_rows - len(combined)
+            if remaining > 0:
+                leftover = full_df.drop(combined.index, errors='ignore')
+                if len(leftover) > 0:
+                    combined = pd.concat([
+                        combined,
+                        leftover.sample(n=min(remaining, len(leftover)))
+                    ], ignore_index=True)
+        else:
+            combined = full_df.sample(n=min(total_rows, len(full_df)))
+
+        combined = combined.sample(frac=1).reset_index(drop=True)
+
+        state.set_status("Processing stratified sample...")
+        if not pipeline._feature_cols:
+            pipeline._feature_cols = [c for c in combined.columns if c not in META_COLS + [LABEL_COL]]
+            pipeline.graph_builder.feature_cols = pipeline._feature_cols
+        pipeline.process_new_flows(combined, source_file="mixed_stratified")
+        state.set_status(f"Loaded stratified sample ({state.get_record_count()} graphs)")
+
+    sb.success(f"{state.get_record_count()} graphs loaded from {len(available)} datasets")
 
 
 def _render_live_controls(sb):
@@ -267,14 +344,14 @@ def render_query_page(nl_engine, state, mode):
     cols = st.columns(3)
     for i, example in enumerate(NL_QUERY_EXAMPLES):
         if cols[i % 3].button(example, use_container_width=True, key=f"ex_{i}"):
-            st.session_state['nl_query'] = example
+            st.session_state['query_input'] = example
+            st.rerun()
 
     query = st.text_input(
         "Describe the network activity you're looking for:",
-        value=st.session_state.get('nl_query', ''),
         key='query_input',
     )
-    top_k = st.slider("Number of results", 3, 15, 5)
+    top_k = st.slider("Number of results", 3, 15, 5, key="nl_top_k")
 
     if query:
         with st.spinner("Searching cross-attention embedding space..."):
@@ -421,91 +498,6 @@ def render_topology_page(state):
         for lbl, cnt in label_counts.most_common():
             st.markdown(f"- {lbl}: {cnt}")
 
-
-# ── Page: Architecture ────────────────────────────────────────
-
-def render_architecture_page():
-    st.title("Model Architecture")
-    st.markdown(
-        "This system uses a **two-stage architecture** for network traffic analysis, "
-        "combining a Graph Neural Network with a cross-attention bridge to a BERT "
-        "language model."
-    )
-
-    st.subheader("Stage 1: GNN Encoder")
-    st.markdown("""
-**Model:** 3-layer GATv2Conv (Graph Attention Network v2)
-
-**Input:** IP-flow graphs where:
-- **Nodes** = IP addresses
-- **Edges** = network flows (one per directed IP pair per window)
-- **Features** = 77 CICFlowMeter features per edge (packet counts, byte lengths, IATs, flags, etc.)
-- Node features are computed as the mean of outgoing edge features, then StandardScaler-normalized
-
-**Architecture:**
-```
-Input [N, 77] → GATv2Conv(77→128, 4 heads) → ELU
-             → GATv2Conv(512→128, 4 heads) → ELU
-             → GATv2Conv(512→128, 1 head)
-             → Node embeddings [N, 128]
-             → Global Mean Pool → Graph embedding [128]
-```
-
-**Training:** Trained on 2,934 graph snapshots from CIC-IDS2017 (30-second sliding windows)
-with 7 attack classes. Balanced via oversampling with cross-entropy loss.
-    """)
-
-    st.subheader("Stage 2: Cross-Attention Bridge")
-    st.markdown("""
-**Purpose:** Align graph embeddings with text embeddings in a shared 256-dim space
-for natural language retrieval over network traffic.
-
-**Components:**
-- **GNN Encoder** (frozen from Stage 1) → 128-dim graph representations
-- **BERT** (`bert-base-uncased`, frozen) → 768-dim text representations
-- **Graph Projection:** Linear(128→256) + GELU + LayerNorm + Linear(256→256)
-- **Text Projection:** Linear(768→256) + GELU + LayerNorm + Linear(256→256)
-- **SigLIP contrastive loss** with learnable temperature
-
-**Training:** 50 epochs on ~16K graph-text pairs (template-generated descriptions),
-with cosine-annealing LR schedule and gradient accumulation.
-
-**Output:** L2-normalized 256-dim embeddings enabling cosine-similarity search
-between arbitrary text queries and network traffic graph snapshots.
-    """)
-
-    st.subheader("Graph Construction Pipeline")
-    st.markdown("""
-```
-Raw PCAP / CIC-IDS2017 CSV
-    ↓
-CICFlowMeter (77 features per flow)
-    ↓
-Sliding windows (30s window, 10s stride)
-    ↓
-Directed graph (nx.DiGraph): IPs → nodes, flows → edges
-    ↓
-Node features: mean(outgoing edge features) → StandardScaler
-    ↓
-PyG Data: x=[N,77], edge_index=[2,E]
-    ↓
-Stage 1 GNN → 128-dim embedding (graph-level)
-Stage 2 Bridge → 256-dim shared space embedding
-```
-    """)
-
-    st.subheader("CIC-IDS2017 Dataset")
-    st.markdown("""
-| Attack Class | Label ID | Examples |
-|---|---|---|
-| Benign | 0 | Normal HTTP/HTTPS browsing |
-| DoS | 1 | Hulk, GoldenEye, Slowloris, Slowhttptest |
-| DDoS | 2 | LOIT (Low Orbit Ion Cannon variant) |
-| PortScan | 3 | Nmap-style TCP SYN scanning |
-| BruteForce | 4 | FTP-Patator, SSH-Patator |
-| WebAttack | 5 | SQL injection, XSS, brute force login |
-| Bot/Other | 6 | Ares botnet, Infiltration, Heartbleed |
-    """)
 
 
 if __name__ == "__main__":

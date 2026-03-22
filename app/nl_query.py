@@ -86,9 +86,11 @@ def generate_template_description(stats):
     return t[hash_val % len(t)]
 
 
-def generate_summary(results):
+def generate_summary(results, filtered_count=0):
     """Aggregate multiple query results into a natural language summary."""
     if not results:
+        if filtered_count > 0:
+            return f"No results exceeded the similarity threshold. {filtered_count} candidate(s) were below the cutoff."
         return "No matching network activity found."
 
     gt_counts = Counter()
@@ -110,6 +112,8 @@ def generate_summary(results):
 
     summary = f"Found {len(results)} matching graph snapshots: {', '.join(parts)}. "
     summary += f"Total: {total_nodes} network nodes, {total_edges} connections across matched windows."
+    if filtered_count > 0:
+        summary += f" ({filtered_count} additional candidate(s) below similarity threshold.)"
     return summary
 
 
@@ -120,16 +124,19 @@ class NLQueryEngine:
         self.inference = inference_engine
         self.state = state
 
-    def query(self, text, top_k=5):
-        """Text -> retrieve top-K similar graphs from state.
+    SIM_THRESHOLD = 0.25
 
-        Returns list of dicts: {record, similarity, description, stats}
+    def query(self, text, top_k=5):
+        """Text -> retrieve top-K similar graphs above similarity threshold.
+
+        Returns (results, filtered_count) where filtered_count is the number
+        of candidates that were in the top-K but fell below the threshold.
         """
         text_emb = self.inference.get_text_embedding(text)
         records = self.state.get_records()
 
         if not records:
-            return []
+            return [], 0
 
         graph_embs = np.array([r.embedding_256 for r in records])
         sims = graph_embs @ text_emb  # cosine similarity (already L2-normalized)
@@ -138,21 +145,26 @@ class NLQueryEngine:
         top_indices = np.argsort(sims)[-k:][::-1]
 
         results = []
+        filtered_count = 0
         for idx in top_indices:
+            sim = float(sims[idx])
+            if sim < self.SIM_THRESHOLD:
+                filtered_count += 1
+                continue
             record = records[idx]
             stats = extract_graph_statistics(record)
             desc = generate_template_description(stats)
             results.append({
                 'record': record,
-                'similarity': float(sims[idx]),
+                'similarity': sim,
                 'description': desc,
                 'stats': stats,
             })
 
-        return results
+        return results, filtered_count
 
     def query_with_summary(self, text, top_k=5):
         """Query + generate an aggregated NL summary."""
-        results = self.query(text, top_k)
-        summary = generate_summary(results)
+        results, filtered_count = self.query(text, top_k)
+        summary = generate_summary(results, filtered_count)
         return results, summary

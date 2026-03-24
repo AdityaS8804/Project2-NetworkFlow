@@ -152,6 +152,42 @@ class AuxiliaryHeads(nn.Module):
         self.density_predictor = nn.Sequential(nn.Linear(hidden_dim, 64), nn.ReLU(), nn.Linear(64, 1), nn.Sigmoid())
         self.task_weights = {'attack': 0.4, 'property': 0.3, 'triplet': 0.3}
 
+    def compute_loss(self, graph_embs, text_embs, batch):
+        """Compute auxiliary losses: attack classification + property prediction + triplet."""
+        losses = {}
+        metrics = {}
+
+        if hasattr(batch, 'y_attack'):
+            logits = self.attack_head(graph_embs)
+            loss_atk = F.cross_entropy(logits, batch.y_attack, label_smoothing=0.1)
+            losses['attack'] = loss_atk
+            with torch.no_grad():
+                acc = (logits.argmax(1) == batch.y_attack).float().mean().item()
+            metrics['attack_cls_acc'] = acc
+
+        if hasattr(batch, 'num_nodes_label'):
+            pred_nodes = self.node_predictor(text_embs).squeeze(-1) / 100.0
+            pred_edges = self.edge_predictor(text_embs).squeeze(-1) / 100.0
+            pred_density = self.density_predictor(text_embs).squeeze(-1)
+            loss_prop = (
+                0.3 * F.mse_loss(pred_nodes, batch.num_nodes_label / 100.0) +
+                0.3 * F.mse_loss(pred_edges, batch.num_edges_label / 100.0) +
+                0.4 * F.mse_loss(pred_density, batch.density_label)
+            )
+            losses['property'] = loss_prop
+
+        if hasattr(batch, 'y_attack') and graph_embs.size(0) > 2:
+            pos_sim = F.cosine_similarity(graph_embs, text_embs, dim=1)
+            neg_text = text_embs.roll(1, dims=0)
+            neg_sim = F.cosine_similarity(graph_embs, neg_text, dim=1)
+            loss_triplet = torch.clamp(0.5 + neg_sim - pos_sim, min=0.0).mean()
+            losses['triplet'] = loss_triplet
+            with torch.no_grad():
+                metrics['triplet_violations'] = (neg_sim > pos_sim).float().mean().item()
+
+        total = sum(self.task_weights.get(k, 0.3) * v for k, v in losses.items())
+        return total, metrics
+
 
 class CrossAttentionBridgeV2(nn.Module):
     """v2.2: QFormer + SigLIP + ConGraT soft targets."""
@@ -225,3 +261,83 @@ class CrossAttentionBridgeV2(nn.Module):
         text_embs = self.text_encoder.encode(texts)
         text_embs = self.text_proj(text_embs)
         return F.normalize(text_embs, dim=-1)
+
+    def forward(self, batch, texts, compute_auxiliary=True):
+        """Full forward pass: encode, compute SigLIP + auxiliary losses."""
+        node_embs = self.gnn.encode(batch.x, batch.edge_index)
+
+        if self.use_qformer:
+            graph_embs = self.qformer(node_embs, batch.batch)
+        else:
+            graph_embs = self.pool_graph(node_embs, batch.batch)
+        graph_embs = self.graph_proj(graph_embs)
+
+        text_embs = self.text_encoder.encode(texts)
+        text_embs = self.text_proj(text_embs)
+
+        graph_normed = F.normalize(graph_embs, dim=-1)
+        text_normed = F.normalize(text_embs, dim=-1)
+
+        attack_labels = batch.y_attack if hasattr(batch, 'y_attack') else None
+        contrastive_loss, metrics = self._siglip(graph_normed, text_normed, attack_labels)
+
+        aux_loss = torch.tensor(0.0, device=graph_normed.device)
+        if compute_auxiliary and self.use_auxiliary_tasks and hasattr(batch, 'y_attack'):
+            aux_loss, aux_metrics = self.auxiliary.compute_loss(graph_embs, text_embs, batch)
+            metrics.update(aux_metrics)
+
+        total_loss = self.contrastive_weight * contrastive_loss + self.auxiliary_weight * aux_loss
+        metrics['total_loss'] = total_loss.item()
+
+        return graph_normed, text_normed, total_loss, metrics
+
+    def _siglip(self, graph_embs, text_embs, attack_labels=None):
+        """SigLIP sigmoid contrastive loss with soft targets."""
+        B = graph_embs.size(0)
+        temp = self.temperature.clamp(min=0.01, max=1.0)
+        logits = (graph_embs @ text_embs.T) / temp
+
+        if attack_labels is not None and self.soft_target_alpha > 0:
+            class_sim = (attack_labels.unsqueeze(0) == attack_labels.unsqueeze(1)).float()
+            identity = torch.eye(B, device=logits.device)
+            soft_targets = (1.0 - self.soft_target_alpha) * identity + self.soft_target_alpha * class_sim
+            labels = 2.0 * soft_targets - 1.0
+        else:
+            labels = 2.0 * torch.eye(B, device=logits.device) - 1.0
+
+        loss = -F.logsigmoid(labels * logits).mean()
+
+        with torch.no_grad():
+            hard_targets = torch.arange(B, device=logits.device)
+            acc_g2t = (logits.argmax(1) == hard_targets).float().mean().item()
+            acc_t2g = (logits.T.argmax(1) == hard_targets).float().mean().item()
+            pos_sim = torch.diagonal(logits).mean().item()
+            mask = ~torch.eye(B, dtype=bool, device=logits.device)
+            neg_sim = logits[mask].mean().item()
+
+        return loss, {
+            'contrastive_loss': loss.item(),
+            'acc_g2t': acc_g2t, 'acc_t2g': acc_t2g,
+            'acc_avg': (acc_g2t + acc_t2g) / 2,
+            'pos_sim': pos_sim, 'neg_sim': neg_sim,
+            'temperature': temp.item(),
+        }
+
+    def save_checkpoint(self, path, epoch, optimizer_state=None):
+        """Save checkpoint compatible with inference_engine.py loading."""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': self.state_dict(),
+            'config': {
+                'hidden_dim': self.hidden_dim, 'pooling': self.pooling,
+                'gnn_dim': self.gnn_dim, 'text_dim': self.text_dim,
+                'use_auxiliary_tasks': self.use_auxiliary_tasks,
+                'contrastive_weight': self.contrastive_weight,
+                'auxiliary_weight': self.auxiliary_weight,
+                'use_qformer': self.use_qformer,
+                'soft_target_alpha': self.soft_target_alpha,
+                'version': 'v2.2',
+            },
+            'optimizer_state_dict': optimizer_state,
+        }, path)

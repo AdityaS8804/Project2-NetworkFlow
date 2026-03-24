@@ -353,14 +353,14 @@ def build_topology_graph(nx_graph, node_labels=None, title="Network Topology"):
         node_colors.append(ATTACK_COLORS.get(label_id, '#95a5a6'))
 
         degree = G.degree(n)
-        ip = G.nodes[n].get('ip', str(n))
+        ip = str(G.nodes[n].get('ip', n))
         node_text.append(f"IP: {ip}<br>Label: {label}<br>Degree: {degree}")
 
     node_trace = go.Scatter(
         x=node_x, y=node_y,
         mode='markers+text',
         hoverinfo='text',
-        text=[G.nodes[n].get('ip', str(n))[:15] for n in G.nodes()],
+        text=[str(G.nodes[n].get('ip', n))[:15] for n in G.nodes()],
         textposition="top center",
         textfont=dict(size=8),
         marker=dict(
@@ -414,5 +414,106 @@ def build_similarity_bars(results):
         height=max(200, 50 * len(results)),
         margin=dict(t=40, l=250),
         yaxis=dict(autorange="reversed"),
+    )
+    return fig
+
+
+# ── Live Network topology graph ──────────────────────────────
+
+def build_live_topology_graph(nx_graph, title="Live Network (Ground Truth)"):
+    """Network graph with nodes AND edges colored by ground truth attack label.
+
+    Extends the base topology graph with:
+    - Edge coloring by the edge 'label' attribute
+    - Node size scaled by degree
+    - A legend showing color → attack type mapping
+    """
+    if nx_graph is None or nx_graph.number_of_nodes() == 0:
+        return go.Figure().add_annotation(text="No graph data", showarrow=False)
+
+    G = nx_graph
+    pos = nx.spring_layout(G, seed=42, k=2.0 / np.sqrt(G.number_of_nodes()))
+
+    traces = []
+
+    # Edges — one trace per label for coloring
+    edge_groups = {}
+    for u, v, data in G.edges(data=True):
+        label = _normalize_gt(data.get("label", "Unknown"))
+        edge_groups.setdefault(label, []).append((u, v))
+
+    for label, edges in edge_groups.items():
+        edge_x, edge_y = [], []
+        for u, v in edges:
+            x0, y0 = pos[u]
+            x1, y1 = pos[v]
+            edge_x.extend([x0, x1, None])
+            edge_y.extend([y0, y1, None])
+
+        color = GT_COLORS.get(label, "#95a5a6")
+        traces.append(go.Scatter(
+            x=edge_x, y=edge_y,
+            line=dict(width=1.2, color=color),
+            hoverinfo="none",
+            mode="lines",
+            name=f"{label} (edges)",
+            showlegend=False,
+        ))
+
+    # Nodes — one trace per label for legend
+    node_groups = {}
+    for n in G.nodes():
+        label = _normalize_gt(G.nodes[n].get("label", "Unknown"))
+        node_groups.setdefault(label, []).append(n)
+
+    for label, nodes in node_groups.items():
+        node_x = [pos[n][0] for n in nodes]
+        node_y = [pos[n][1] for n in nodes]
+        degrees = [G.degree(n) for n in nodes]
+        sizes = [max(12, min(40, 8 + d * 3)) for d in degrees]
+        hover_text = [
+            f"IP: {str(G.nodes[n].get('ip', n))}<br>"
+            f"Label: {G.nodes[n].get('label', '?')}<br>"
+            f"Degree: {G.degree(n)}"
+            for n in nodes
+        ]
+        ip_labels = [str(G.nodes[n].get("ip", n))[-12:] for n in nodes]
+        color = GT_COLORS.get(label, "#95a5a6")
+
+        traces.append(go.Scatter(
+            x=node_x, y=node_y,
+            mode="markers+text",
+            hoverinfo="text",
+            hovertext=hover_text,
+            text=ip_labels,
+            textposition="top center",
+            textfont=dict(size=7),
+            marker=dict(
+                size=sizes,
+                color=color,
+                line=dict(width=1, color="black"),
+            ),
+            name=label,
+            legendgroup=label,
+            showlegend=True,
+        ))
+
+    fig = go.Figure(data=traces)
+    fig.update_layout(
+        title=title,
+        showlegend=True,
+        legend=dict(
+            title="Attack Type",
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1,
+        ),
+        hovermode="closest",
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        height=600,
+        margin=dict(t=60, b=20, l=20, r=20),
     )
     return fig

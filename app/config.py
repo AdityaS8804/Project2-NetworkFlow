@@ -61,3 +61,9 @@ MIN_NODES = 2
 MAX_RECORDS = 500
 REFRESH_INTERVAL_SEC = 5
 POLL_INTERVAL_SEC = 2.0
+
+# Live data emulation
+CICIDS_DIR = os.path.join(BASE_DIR, "cicids2017")
+EMULATION_STATE_PATH = os.path.join(WATCH_DIR, ".emulation_state.json")
+EMULATOR_CHUNK_PREFIX = "emulated_chunk_"
+LIVE_NETWORK_REFRESH_SEC = 4

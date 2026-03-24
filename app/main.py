@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 from collections import Counter
 
-from app.config import WATCH_DIR, REFRESH_INTERVAL_SEC, ID_TO_ATTACK, ATTACK_LABEL_MAP, META_COLS, LABEL_COL
+from app.config import WATCH_DIR, REFRESH_INTERVAL_SEC, LIVE_NETWORK_REFRESH_SEC, ID_TO_ATTACK, ATTACK_LABEL_MAP, META_COLS, LABEL_COL
 from app.state import AppState
 from app.pipeline import BackgroundPipeline
 from app.watcher import PcapWatcher
@@ -126,7 +126,7 @@ def main():
     st.sidebar.markdown("---")
     page = st.sidebar.radio(
         "Navigation",
-        ["Embedding Explorer", "NL Query", "Graph Inspector"],
+        ["Embedding Explorer", "NL Query", "Graph Inspector", "Live Network"],
     )
     auto_refresh = st.sidebar.checkbox("Auto-refresh", value=(mode == "Live"))
 
@@ -136,9 +136,15 @@ def main():
         render_query_page(nl_engine, state, mode)
     elif page == "Graph Inspector":
         render_topology_page(state)
+    elif page == "Live Network":
+        from app.live_network_page import render_live_network_page
+        render_live_network_page(state)
 
     if auto_refresh and page == "Embedding Explorer":
         time.sleep(REFRESH_INTERVAL_SEC)
+        st.rerun()
+    elif auto_refresh and page == "Live Network":
+        time.sleep(LIVE_NETWORK_REFRESH_SEC)
         st.rerun()
 
 
@@ -356,6 +362,21 @@ def render_query_page(nl_engine, state, mode):
     if query:
         with st.spinner("Searching cross-attention embedding space..."):
             results, summary = nl_engine.query_with_summary(query, top_k=top_k)
+
+        # ── Similarity debug info ─────────────────────────
+        all_records = state.get_records()
+        if all_records:
+            import numpy as np
+            graph_embs = np.array([r.embedding_256 for r in all_records])
+            text_emb = nl_engine.inference.get_text_embedding(query)
+            all_sims = graph_embs @ text_emb
+            st.caption(
+                f"Similarity stats across {len(all_records)} graphs: "
+                f"max={float(all_sims.max()):.4f}, "
+                f"mean={float(all_sims.mean()):.4f}, "
+                f"min={float(all_sims.min()):.4f} | "
+                f"threshold={nl_engine.SIM_THRESHOLD}"
+            )
 
         # ── Summary ────────────────────────────────────────
         st.markdown("### Retrieval Results")

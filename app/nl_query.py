@@ -124,7 +124,7 @@ class NLQueryEngine:
         self.inference = inference_engine
         self.state = state
 
-    SIM_THRESHOLD = 0.25
+    SIM_THRESHOLD = 0.05
 
     def query(self, text, top_k=5):
         """Text -> retrieve top-K similar graphs above similarity threshold.
@@ -143,6 +143,13 @@ class NLQueryEngine:
 
         k = min(top_k, len(records))
         top_indices = np.argsort(sims)[-k:][::-1]
+
+        # Log similarity range for debugging
+        top_sims = [float(sims[i]) for i in top_indices]
+        if top_sims:
+            print(f"[NLQuery] Query: '{text[:50]}' | Top-{k} sims: "
+                  f"max={max(top_sims):.4f}, min={min(top_sims):.4f}, "
+                  f"threshold={self.SIM_THRESHOLD}")
 
         results = []
         filtered_count = 0

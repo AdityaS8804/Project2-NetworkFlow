@@ -139,6 +139,7 @@ class InferenceEngine:
                 graph_emb = (graph_emb - self._emb_mean) / self._emb_std
             logits = self.attack_classifier(graph_emb)
         else:
+            print("WARNING: attack_classifier is None — returning uniform logits (all Benign)")
             logits = torch.zeros(1, NUM_CLASSES, device=self.device)
 
         probs = F.softmax(logits, dim=-1).cpu().numpy()[0]

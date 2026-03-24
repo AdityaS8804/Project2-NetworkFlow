@@ -133,7 +133,7 @@ def _convert_to_ethernet_pcap(pcap_path, output_dir):
             eth_packets.append(pkt)
 
     if eth_packets:
-        wrpcap(out_path, eth_packets)
+        wrpcap(out_path, eth_packets, snaplen=65535)
     return out_path
 
 

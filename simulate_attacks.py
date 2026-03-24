@@ -298,7 +298,10 @@ def simulate_dos_hulk(duration=90):
     num_sessions = random.randint(20, 30)
 
     for i in range(num_sessions):
-        src_ip = ATTACKER_IPS[i % 2]  # 2 attacker IPs
+        # src_ip = ATTACKER_IPS[i % 2]  # 2 attacker IPs
+        attacker_pool = [f"172.16.{random.randint(0,5)}.{random.randint(1,254)}" for _ in range(20)] 
+        # Larger pool instead of 2 ips to create more diverse graphs, while still in the private range like the dataset's attackers. 
+        src_ip = random.choice(attacker_pool)
         sport = rand_high_port()
         session_start = base + jitter(i * (duration / num_sessions), 1.0, 0)
 

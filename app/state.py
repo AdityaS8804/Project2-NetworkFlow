@@ -20,7 +20,8 @@ class GraphRecord:
     attack_probs: np.ndarray        # [7] class probabilities
     nx_graph: object                # NetworkX DiGraph
     metadata: dict                  # window_start, window_end, num_flows, etc.
-    ground_truth_label: str = "Unknown"  # from PCAP filename
+    ground_truth_label: str = "Unknown"  # from PCAP filename or CSV label
+    predicted_label: str = "Unknown"     # from model inference (ID_TO_ATTACK[attack_pred])
 
 
 class AppState:

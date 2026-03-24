@@ -268,12 +268,14 @@ def render_embedding_page(state, mode):
         return
 
     # ── Summary metrics ────────────────────────────────────
-    gt_counts = Counter(r.ground_truth_label for r in records)
+    # Always use ground-truth / filename-derived labels for primary display.
+    # Model inference still runs (predictions stored in record.predicted_label).
+    label_counts = Counter(r.ground_truth_label for r in records)
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total Graph Snapshots", len(records))
     col2.metric("Unique Traffic Types",
-                len([k for k in gt_counts if k != "Benign" and k != "Unknown"]))
+                len([k for k in label_counts if k != "Benign" and k != "Unknown"]))
     col3.metric("Avg Nodes / Graph",
                 f"{np.mean([r.metadata.get('num_nodes', 0) for r in records]):.0f}")
     col4.metric("Avg Edges / Graph",
@@ -283,7 +285,7 @@ def render_embedding_page(state, mode):
     st.subheader("Graph Embedding Space (Stage 1 GNN)")
     st.caption(
         "Each point is a traffic graph encoded by the 3-layer GATv2Conv network. "
-        "Colors show CIC-IDS2017 ground truth labels. Clustering indicates the GNN "
+        "Colors show traffic labels. Clustering indicates the GNN "
         "learns structurally distinct representations for different traffic types."
     )
 
@@ -369,13 +371,15 @@ def render_query_page(nl_engine, state, mode):
         for i, r in enumerate(results):
             rec = r['record']
             stats = r['stats']
+            pred = rec.predicted_label
             gt = rec.ground_truth_label
+            conf = rec.attack_probs[rec.attack_pred]
             n = stats['num_nodes']
             e = stats['num_edges']
 
             with st.expander(
                 f"#{i+1}  sim={r['similarity']:.3f}  |  "
-                f"GT: {gt}  |  {n} nodes, {e} edges  |  "
+                f"Pred: {pred} ({conf:.0%})  |  {n} nodes, {e} edges  |  "
                 f"density={stats['density']:.4f}",
                 expanded=(i == 0),
             ):
@@ -384,7 +388,8 @@ def render_query_page(nl_engine, state, mode):
                 with col_desc:
                     st.markdown(f"**Matched Description:**")
                     st.markdown(f"> {r['description']}")
-                    st.markdown(f"**Ground Truth Label:** `{gt}`")
+                    st.markdown(f"**Model Prediction:** `{pred}` ({conf:.1%} confidence)")
+                    st.markdown(f"**Reference (Filename):** `{gt}`")
                     st.markdown(f"**Window:** {stats['window_start']}")
                     st.markdown(f"**Flows:** {stats['num_flows']}")
 
@@ -425,7 +430,7 @@ def render_topology_page(state):
 
     # ── Graph selector ─────────────────────────────────────
     options = {
-        f"Window {i+1} — GT: {r.ground_truth_label} "
+        f"Window {i+1} — {r.ground_truth_label} "
         f"({r.metadata.get('num_nodes', '?')}n, {r.metadata.get('num_edges', '?')}e) "
         f"@ {r.metadata.get('window_start_ts', '')}": i
         for i, r in enumerate(records)
@@ -437,11 +442,12 @@ def render_topology_page(state):
     G = record.nx_graph
 
     # ── Metrics ────────────────────────────────────────────
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Nodes (IPs)", record.metadata.get('num_nodes', '?'))
     col2.metric("Edges (Flows)", record.metadata.get('num_edges', '?'))
-    col3.metric("Ground Truth", record.ground_truth_label)
-    col4.metric("Flows in Window", record.metadata.get('num_flows', '?'))
+    col3.metric("Traffic Type", record.ground_truth_label)
+    col4.metric("Model Prediction", record.predicted_label)
+    col5.metric("Confidence", f"{record.attack_probs[record.attack_pred]:.1%}")
 
     # ── Topology visualization ─────────────────────────────
     st.subheader("Network Topology")

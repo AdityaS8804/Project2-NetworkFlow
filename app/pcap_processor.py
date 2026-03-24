@@ -99,16 +99,66 @@ _JAVA_CFM_TO_CIC = {
 DOCKER_IMAGE = "cicflowmeter"
 
 
+_cached_docker_env = None
+
+
+def _docker_env():
+    """Return environment dict with DOCKER_HOST set so the cicflowmeter image is reachable.
+
+    Docker Desktop on macOS may use a non-default socket. We probe candidate
+    sockets once, cache the result, and reuse it for all subsequent calls.
+    """
+    global _cached_docker_env
+    if _cached_docker_env is not None:
+        return _cached_docker_env
+
+    candidates = [
+        None,  # no override — use whatever Docker CLI resolves
+        os.path.expanduser("~/.docker/run/docker.sock"),
+        "/var/run/docker.sock",
+    ]
+    for sock in candidates:
+        env = os.environ.copy()
+        if sock is not None and os.path.exists(sock):
+            env['DOCKER_HOST'] = f"unix://{sock}"
+        elif sock is not None:
+            continue
+        try:
+            r = subprocess.run(
+                ["docker", "image", "inspect", DOCKER_IMAGE],
+                capture_output=True, timeout=5, env=env,
+            )
+            if r.returncode == 0:
+                _cached_docker_env = env
+                return env
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+
+    # Fallback — return plain env (will likely fail, but _docker_available handles that)
+    _cached_docker_env = os.environ.copy()
+    return _cached_docker_env
+
+
 def _docker_available():
-    """Check if Docker is available and the cicflowmeter image exists."""
-    try:
-        result = subprocess.run(
-            ["docker", "image", "inspect", DOCKER_IMAGE],
-            capture_output=True, timeout=5
-        )
-        return result.returncode == 0
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return False
+    """Check if Docker is available and the cicflowmeter image exists.
+
+    Docker Desktop on macOS can be slow to respond after idle; retry once.
+    """
+    for attempt in range(2):
+        try:
+            result = subprocess.run(
+                ["docker", "image", "inspect", DOCKER_IMAGE],
+                capture_output=True, timeout=10,
+                env=_docker_env(),
+            )
+            if result.returncode == 0:
+                return True
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+        if attempt == 0:
+            import time
+            time.sleep(1)
+    return False
 
 
 def _convert_to_ethernet_pcap(pcap_path, output_dir):
@@ -159,7 +209,8 @@ def _run_java_cicflowmeter(pcap_path):
                 DOCKER_IMAGE,
                 f"/data/in/{pcap_name}", "/data/out/"
             ],
-            capture_output=True, text=True, timeout=120
+            capture_output=True, text=True, timeout=120,
+            env=_docker_env(),
         )
 
         if result.returncode != 0:

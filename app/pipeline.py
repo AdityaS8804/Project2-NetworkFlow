@@ -78,62 +78,81 @@ class BackgroundPipeline:
         self.state.set_status("Ready. Waiting for PCAPs...")
 
     def _load_scaler(self):
-        """Load pre-fit StandardScaler from disk, or warn and skip."""
+        """Load pre-fit StandardScaler and training feature column order from disk."""
+        scaler = None
         if os.path.exists(SCALER_PATH):
             print(f"Loading scaler from {SCALER_PATH}")
-            return joblib.load(SCALER_PATH)
+            scaler = joblib.load(SCALER_PATH)
+        else:
+            print(f"WARNING: No scaler found at {SCALER_PATH}. Features will not be normalized.")
 
-        print(f"WARNING: No scaler found at {SCALER_PATH}. Features will not be normalized.")
-        return None
+        # Load the saved feature column order so features are always aligned
+        # with the scaler's per-column mean/std.
+        feature_cols_path = os.path.join(os.path.dirname(SCALER_PATH), 'feature_cols.pkl')
+        if os.path.exists(feature_cols_path):
+            self._feature_cols = joblib.load(feature_cols_path)
+            print(f"Loaded {len(self._feature_cols)} feature columns from {feature_cols_path}")
+        else:
+            print(f"WARNING: No feature_cols.pkl found at {feature_cols_path}. "
+                  "Column ordering will be inferred from data (may mismatch scaler).")
+
+        return scaler
 
     def process_new_flows(self, df, source_file="unknown"):
         """Full pipeline: DataFrame -> graphs -> embeddings -> state.
 
-        If source_file matches a known attack pattern in PCAP_LABEL_MAP,
-        the graph-level label is injected from the filename rather than
-        derived from majority-vote on CICFlowMeter labels (which are all
-        BENIGN in live mode, causing every attack to be misclassified as
-        Benign).
+        The model's own prediction is always used as the primary label
+        (predicted_label).  If source_file matches a known attack pattern
+        in PCAP_LABEL_MAP, that is stored as ground_truth_label for
+        reference / comparison, but it does NOT override model inference.
         """
         if not self._feature_cols:
             self._feature_cols = [c for c in df.columns if c not in META_COLS + [LABEL_COL]]
             self.graph_builder.feature_cols = self._feature_cols
 
-        # Derive ground-truth label from filename once for the whole batch.
-        # None means unknown — we fall back to majority voting as before.
+        # Enforce training-time column order so the scaler applies the
+        # correct per-feature mean/std.  Add any missing columns as zeros.
+        for col in self._feature_cols:
+            if col not in df.columns:
+                df[col] = 0.0
+        meta_present = [c for c in df.columns if c in set(META_COLS + [LABEL_COL])]
+        df = df[meta_present + list(self._feature_cols)]
+
+        # Derive ground-truth reference label from filename (if available).
         known_label_id = _label_id_from_filename(source_file)
         if known_label_id is not None:
-            attack_name = ID_TO_ATTACK.get(known_label_id, "Unknown")
-            print(f"  [Pipeline] Injecting label from filename: "
-                  f"'{source_file}' → {attack_name} (id={known_label_id})")
+            gt_label = ID_TO_ATTACK.get(known_label_id, "Unknown")
+            print(f"  [Pipeline] Filename reference label: "
+                  f"'{source_file}' → {gt_label} (id={known_label_id})")
+        else:
+            gt_label = None  # will be resolved per-graph below
 
         new_graphs = self.graph_builder.add_flows(df)
 
         for pyg_data, nx_graph, metadata in new_graphs:
             try:
-                # --- Label injection ---
-                # Prefer filename-derived label (live mode); fall back to
-                # majority-vote on node labels (demo / CSV mode with real labels).
-                if known_label_id is not None:
-                    pyg_data = _inject_label(pyg_data, known_label_id)
-                    gt_label = ID_TO_ATTACK.get(known_label_id, "Unknown")
+                # Resolve ground-truth label (for reference only, not displayed
+                # as the primary label in live mode).
+                if gt_label is not None:
+                    resolved_gt = gt_label
                 else:
-                    # Original majority-vote path (used when loading labelled CSVs)
-                    gt_label = "Unknown"
+                    # Majority-vote path (used when loading labelled CSVs)
+                    resolved_gt = "Unknown"
                     if hasattr(pyg_data, 'node_attack_labels'):
                         labels = pyg_data.node_attack_labels.tolist()
                         counts = Counter(labels)
                         attack_only = {k: v for k, v in counts.items() if k != 0}
                         if attack_only:
-                            gt_label = ID_TO_ATTACK.get(
+                            resolved_gt = ID_TO_ATTACK.get(
                                 max(attack_only, key=attack_only.get), "Unknown"
                             )
                         else:
-                            gt_label = "Benign"
+                            resolved_gt = "Benign"
 
                 emb_128 = self.inference.get_graph_embedding(pyg_data)
                 emb_256 = self.inference.get_shared_space_embedding(pyg_data)
                 pred, probs = self.inference.get_attack_prediction(pyg_data)
+                predicted_label = ID_TO_ATTACK.get(pred, "Unknown")
 
                 record = GraphRecord(
                     timestamp=metadata['window_start_sec'],
@@ -144,7 +163,8 @@ class BackgroundPipeline:
                     attack_probs=probs,
                     nx_graph=nx_graph,
                     metadata=metadata,
-                    ground_truth_label=gt_label,
+                    ground_truth_label=resolved_gt,
+                    predicted_label=predicted_label,
                 )
                 self.state.add_record(record)
 

@@ -230,8 +230,9 @@ def generate_benign_background(base_time, duration, num_sessions=None):
     Targets ~100-150 unique IPs to match CIC-IDS2017 graph density.
     """
     if num_sessions is None:
-        # ~10:1 benign:attack ratio with enough IPs for graph density
-        num_sessions = random.randint(120, 180)
+        # Keep benign background moderate so attack signal is not diluted
+        # in graph-level mean pooling (~1:1 benign:attack ratio).
+        num_sessions = random.randint(15, 30)
 
     packets = []
     # Sample from the full IP pool — each session uses a different client IP

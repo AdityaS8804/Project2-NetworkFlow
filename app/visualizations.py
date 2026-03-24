@@ -137,6 +137,168 @@ def build_embedding_scatter(records, coords, method="PCA"):
     return fig
 
 
+# ── Predicted label scatter ───────────────────────────────────
+
+def build_embedding_scatter_pred(records, coords, method="PCA"):
+    """Scatter plot of embeddings colored by MODEL PREDICTED label."""
+    if coords is None or len(records) == 0:
+        return go.Figure().add_annotation(text="Not enough data yet", showarrow=False)
+
+    pred_labels = [_normalize_gt(r.predicted_label) for r in records]
+
+    hover_text = [
+        f"Pred: {pl}<br>"
+        f"Confidence: {r.attack_probs[r.attack_pred]:.1%}<br>"
+        f"Ref (file): {_normalize_gt(r.ground_truth_label)}<br>"
+        f"Nodes: {r.metadata.get('num_nodes', '?')}<br>"
+        f"Edges: {r.metadata.get('num_edges', '?')}"
+        for r, pl in zip(records, pred_labels)
+    ]
+
+    fig = go.Figure()
+    for label in sorted(set(pred_labels), key=lambda x: (x != 'Benign', x)):
+        mask = [i for i, l in enumerate(pred_labels) if l == label]
+        fig.add_trace(go.Scatter(
+            x=coords[mask, 0],
+            y=coords[mask, 1],
+            mode='markers',
+            marker=dict(
+                size=10,
+                color=_gt_color(label),
+                line=dict(width=0.5, color='black'),
+            ),
+            name=f"{label} ({len(mask)})",
+            text=[hover_text[i] for i in mask],
+            hoverinfo='text',
+        ))
+
+    fig.update_layout(
+        title=f"{method} of GNN Graph Embeddings (Model Predictions)",
+        xaxis_title=f"{method} 1",
+        yaxis_title=f"{method} 2",
+        height=500,
+        legend=dict(orientation="h", yanchor="bottom", y=-0.2),
+        margin=dict(t=40, b=80),
+    )
+    return fig
+
+
+# ── Predicted label distribution charts ──────────────────────
+
+def build_pred_pie(records):
+    """Pie chart of model-predicted label distribution."""
+    if not records:
+        return go.Figure().add_annotation(text="No data yet", showarrow=False)
+
+    pred_labels = [_normalize_gt(r.predicted_label) for r in records]
+    counts = Counter(pred_labels)
+
+    names = list(counts.keys())
+    values = list(counts.values())
+    colors = [_gt_color(n) for n in names]
+
+    fig = go.Figure(data=[go.Pie(
+        labels=names, values=values,
+        marker=dict(colors=colors),
+        textinfo='label+percent',
+        hoverinfo='label+value',
+    )])
+    fig.update_layout(
+        title="Traffic Type Distribution (Model Predictions)",
+        height=350,
+        margin=dict(t=40),
+    )
+    return fig
+
+
+def build_pred_timeline(records):
+    """Stacked bar chart of predicted labels over time windows."""
+    if not records:
+        return go.Figure().add_annotation(text="No data yet", showarrow=False)
+
+    timestamps = [r.metadata.get('window_start_ts', str(r.timestamp)) for r in records]
+    pred_labels = [_normalize_gt(r.predicted_label) for r in records]
+
+    time_groups = {}
+    for t, l in zip(timestamps, pred_labels):
+        if t not in time_groups:
+            time_groups[t] = Counter()
+        time_groups[t][l] += 1
+
+    sorted_times = sorted(time_groups.keys())
+
+    fig = go.Figure()
+    for label in sorted(set(pred_labels), key=lambda x: (x != 'Benign', x)):
+        counts = [time_groups[t].get(label, 0) for t in sorted_times]
+        fig.add_trace(go.Bar(
+            x=sorted_times,
+            y=counts,
+            name=label,
+            marker_color=_gt_color(label),
+        ))
+
+    fig.update_layout(
+        barmode='stack',
+        title="Traffic Types Over Time (Model Predictions)",
+        xaxis_title="Window",
+        yaxis_title="Count",
+        height=400,
+        legend=dict(orientation="h", yanchor="bottom", y=-0.3),
+        margin=dict(t=40, b=80),
+    )
+    return fig
+
+
+def build_graph_stats_scatter_pred(records):
+    """Scatter plot of graph structural properties colored by predicted label."""
+    if not records:
+        return go.Figure().add_annotation(text="No data yet", showarrow=False)
+
+    nodes = []
+    edges = []
+    densities = []
+    pred_labels = []
+
+    for r in records:
+        G = r.nx_graph
+        n = G.number_of_nodes()
+        e = G.number_of_edges()
+        nodes.append(n)
+        edges.append(e)
+        densities.append(nx.density(G) if n > 1 else 0)
+        pred_labels.append(_normalize_gt(r.predicted_label))
+
+    fig = go.Figure()
+    for label in sorted(set(pred_labels), key=lambda x: (x != 'Benign', x)):
+        mask = [i for i, l in enumerate(pred_labels) if l == label]
+        fig.add_trace(go.Scatter(
+            x=[nodes[i] for i in mask],
+            y=[edges[i] for i in mask],
+            mode='markers',
+            marker=dict(
+                size=[max(8, densities[i] * 100) for i in mask],
+                color=_gt_color(label),
+                line=dict(width=0.5, color='black'),
+                opacity=0.7,
+            ),
+            name=f"{label} ({len(mask)})",
+            text=[f"Pred: {pred_labels[i]}<br>Nodes: {nodes[i]}<br>"
+                  f"Edges: {edges[i]}<br>Density: {densities[i]:.4f}"
+                  for i in mask],
+            hoverinfo='text',
+        ))
+
+    fig.update_layout(
+        title="Graph Structure: Nodes vs Edges (Model Predictions)",
+        xaxis_title="Number of Nodes (IPs)",
+        yaxis_title="Number of Edges (Flows)",
+        height=400,
+        legend=dict(orientation="h", yanchor="bottom", y=-0.2),
+        margin=dict(t=40, b=80),
+    )
+    return fig
+
+
 # ── Ground truth distribution charts ─────────────────────────
 
 def build_gt_pie(records):
@@ -392,13 +554,13 @@ def build_similarity_bars(results):
         return go.Figure().add_annotation(text="No results", showarrow=False)
 
     labels = [
-        f"#{i+1} GT:{r['record'].ground_truth_label} "
+        f"#{i+1} Pred:{r['record'].predicted_label} "
         f"({r['stats']['num_nodes']}n, {r['stats']['num_edges']}e)"
         for i, r in enumerate(results)
     ]
     scores = [r['similarity'] for r in results]
-    gt_labels = [_normalize_gt(r['record'].ground_truth_label) for r in results]
-    colors = [_gt_color(l) for l in gt_labels]
+    pred_labels = [_normalize_gt(r['record'].predicted_label) for r in results]
+    colors = [_gt_color(l) for l in pred_labels]
 
     fig = go.Figure(go.Bar(
         x=scores,

@@ -7,6 +7,8 @@ WATCH_DIR = os.path.join(BASE_DIR, "wireshark")
 CHECKPOINT_STAGE1 = os.path.join(BASE_DIR, "checkpoints/stage1/best.pt")
 CHECKPOINT_STAGE2 = os.path.join(BASE_DIR, "checkpoints/stage2/best.pt")
 SCALER_PATH = os.path.join(BASE_DIR, "checkpoints/stage1/scaler.pkl")
+CLASSIFIER_PATH = os.path.join(BASE_DIR, "checkpoints/stage1/attack_classifier.pt")
+FEATURE_COLS_PATH = os.path.join(BASE_DIR, "checkpoints/stage1/feature_cols.pkl")
 
 # Label maps
 ATTACK_LABEL_MAP = {

@@ -22,6 +22,11 @@ class GraphRecord:
     metadata: dict                  # window_start, window_end, num_flows, etc.
     ground_truth_label: str = "Unknown"  # from PCAP filename
 
+    @property
+    def predicted_label(self) -> str:
+        """Human-readable predicted attack label from Stage 1 classifier."""
+        return ID_TO_ATTACK.get(self.attack_pred, "Unknown")
+
 
 class AppState:
     """Thread-safe shared state between background pipeline and Streamlit UI."""

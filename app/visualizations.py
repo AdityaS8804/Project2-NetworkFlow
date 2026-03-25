@@ -318,7 +318,7 @@ def build_attack_pie(records):
 
 # ── Topology graph ───────────────────────────────────────────
 
-def build_topology_graph(nx_graph, node_labels=None, title="Network Topology"):
+def build_topology_graph(nx_graph, node_labels=None, title="Network Topology", show_labels=True):
     """Plotly network graph visualization using spring layout."""
     if nx_graph is None or nx_graph.number_of_nodes() == 0:
         return go.Figure().add_annotation(text="No graph data", showarrow=False)
@@ -348,13 +348,16 @@ def build_topology_graph(nx_graph, node_labels=None, title="Network Topology"):
     node_colors = []
 
     for n in G.nodes():
-        label = G.nodes[n].get('label', 'Unknown')
-        label_id = ATTACK_LABEL_MAP.get(label, 0)
-        node_colors.append(ATTACK_COLORS.get(label_id, '#95a5a6'))
-
         degree = G.degree(n)
         ip = str(G.nodes[n].get('ip', n))
-        node_text.append(f"IP: {ip}<br>Label: {label}<br>Degree: {degree}")
+        if show_labels:
+            label = G.nodes[n].get('label', 'Unknown')
+            label_id = ATTACK_LABEL_MAP.get(label, 0)
+            node_colors.append(ATTACK_COLORS.get(label_id, '#95a5a6'))
+            node_text.append(f"IP: {ip}<br>Label: {label}<br>Degree: {degree}")
+        else:
+            node_colors.append('#3498db')
+            node_text.append(f"IP: {ip}<br>Degree: {degree}")
 
     node_trace = go.Scatter(
         x=node_x, y=node_y,
@@ -392,19 +395,16 @@ def build_similarity_bars(results):
         return go.Figure().add_annotation(text="No results", showarrow=False)
 
     labels = [
-        f"#{i+1} GT:{r['record'].ground_truth_label} "
-        f"({r['stats']['num_nodes']}n, {r['stats']['num_edges']}e)"
+        f"#{i+1} ({r['stats']['num_nodes']}n, {r['stats']['num_edges']}e)"
         for i, r in enumerate(results)
     ]
     scores = [r['similarity'] for r in results]
-    gt_labels = [_normalize_gt(r['record'].ground_truth_label) for r in results]
-    colors = [_gt_color(l) for l in gt_labels]
 
     fig = go.Figure(go.Bar(
         x=scores,
         y=labels,
         orientation='h',
-        marker_color=colors,
+        marker_color='#3498db',
         text=[f"{s:.3f}" for s in scores],
         textposition='auto',
     ))

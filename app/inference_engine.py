@@ -6,10 +6,8 @@ import torch.nn.functional as F
 from torch_geometric.data import Batch
 from torch_geometric.nn import global_mean_pool
 
-from .config import CHECKPOINT_STAGE1, CHECKPOINT_STAGE2, NUM_CLASSES
+from .config import CHECKPOINT_STAGE1, CHECKPOINT_STAGE2, CLASSIFIER_PATH, NUM_CLASSES
 from .models import GATEncoderWrapper, BERTEncoder, CrossAttentionBridgeV2
-
-CLASSIFIER_PATH = os.path.join(os.path.dirname(CHECKPOINT_STAGE1), 'attack_classifier.pt')
 
 
 class AttackClassifier(nn.Module):

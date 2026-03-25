@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 
-from .config import SCALER_PATH, META_COLS, LABEL_COL
+from .config import SCALER_PATH, FEATURE_COLS_PATH, META_COLS, LABEL_COL
 from .inference_engine import InferenceEngine
 from .graph_builder import GraphBuilder
 from .state import AppState, GraphRecord
@@ -27,6 +27,9 @@ class BackgroundPipeline:
         # Load or create scaler
         scaler = self._load_scaler()
 
+        # Load feature columns from training to ensure consistent ordering
+        self._feature_cols = self._load_feature_cols()
+
         self.graph_builder = GraphBuilder(
             feature_cols=self._feature_cols or [],
             scaler=scaler,
@@ -41,6 +44,15 @@ class BackgroundPipeline:
             return joblib.load(SCALER_PATH)
 
         print(f"WARNING: No scaler found at {SCALER_PATH}. Features will not be normalized.")
+        return None
+
+    def _load_feature_cols(self):
+        """Load feature column names from training to ensure consistent ordering."""
+        if os.path.exists(FEATURE_COLS_PATH):
+            cols = joblib.load(FEATURE_COLS_PATH)
+            print(f"Loaded {len(cols)} feature columns from {FEATURE_COLS_PATH}")
+            return cols
+        print(f"WARNING: No feature_cols found at {FEATURE_COLS_PATH}. Will derive from data.")
         return None
 
     def process_new_flows(self, df, source_file="unknown"):

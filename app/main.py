@@ -23,16 +23,16 @@ from app.visualizations import (
 )
 
 DEMO_CSV_OPTIONS = {
-    "Wednesday (DoS + Slowloris)": (
-        "datasets/csv/Wednesday-workingHours.pcap_ISCX.csv", 0),
+    "Wednesday (DoS Hulk + Slowloris)": (
+        "datasets/csv/Wednesday-workingHours.pcap_ISCX.csv", 73000),
     "Friday Afternoon (DDoS)": (
-        "datasets/csv/Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv", 0),
+        "datasets/csv/Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv", 90000),
     "Friday Afternoon (PortScan)": (
-        "datasets/csv/Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv", 50000),
+        "datasets/csv/Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv", 70000),
     "Thursday Morning (Web Attacks)": (
-        "datasets/csv/Thursday-WorkingHours-Morning-WebAttacks.pcap_ISCX.csv", 0),
+        "datasets/csv/Thursday-WorkingHours-Morning-WebAttacks.pcap_ISCX.csv", 12000),
     "Tuesday (FTP/SSH Brute Force)": (
-        "datasets/csv/Tuesday-WorkingHours.pcap_ISCX.csv", 0),
+        "datasets/csv/Tuesday-WorkingHours.pcap_ISCX.csv", 425000),
     "Monday (Benign only)": (
         "datasets/csv/Monday-WorkingHours.pcap_ISCX.csv", 0),
 }
@@ -363,19 +363,13 @@ def render_query_page(nl_engine, state, mode):
         with st.spinner("Searching cross-attention embedding space..."):
             results, summary = nl_engine.query_with_summary(query, top_k=top_k)
 
-        # ── Similarity debug info ─────────────────────────
-        all_records = state.get_records()
-        if all_records:
-            import numpy as np
-            graph_embs = np.array([r.embedding_256 for r in all_records])
-            text_emb = nl_engine.inference.get_text_embedding(query)
-            all_sims = graph_embs @ text_emb
+        # ── Query intent + similarity debug info ─────────
+        if results:
+            query_class = results[0].get('query_class', '?')
             st.caption(
-                f"Similarity stats across {len(all_records)} graphs: "
-                f"max={float(all_sims.max()):.4f}, "
-                f"mean={float(all_sims.mean()):.4f}, "
-                f"min={float(all_sims.min()):.4f} | "
-                f"threshold={nl_engine.SIM_THRESHOLD}"
+                f"Detected query intent: **{query_class}** | "
+                f"Searched {len(state.get_records())} graphs | "
+                f"Hybrid ranking: Stage 1 class match + Stage 2 embedding similarity"
             )
 
         # ── Summary ────────────────────────────────────────
@@ -390,22 +384,18 @@ def render_query_page(nl_engine, state, mode):
         for i, r in enumerate(results):
             rec = r['record']
             stats = r['stats']
-            gt = rec.ground_truth_label
             n = stats['num_nodes']
             e = stats['num_edges']
 
             with st.expander(
                 f"#{i+1}  sim={r['similarity']:.3f}  |  "
-                f"GT: {gt}  |  {n} nodes, {e} edges  |  "
+                f"{n} nodes, {e} edges  |  "
                 f"density={stats['density']:.4f}",
                 expanded=(i == 0),
             ):
                 col_desc, col_topo = st.columns([1, 1])
 
                 with col_desc:
-                    st.markdown(f"**Matched Description:**")
-                    st.markdown(f"> {r['description']}")
-                    st.markdown(f"**Ground Truth Label:** `{gt}`")
                     st.markdown(f"**Window:** {stats['window_start']}")
                     st.markdown(f"**Flows:** {stats['num_flows']}")
 
@@ -425,6 +415,7 @@ def render_query_page(nl_engine, state, mode):
                     fig_topo = build_topology_graph(
                         rec.nx_graph,
                         title=f"Topology #{i+1}",
+                        show_labels=False,
                     )
                     st.plotly_chart(fig_topo, use_container_width=True)
 
@@ -458,11 +449,12 @@ def render_topology_page(state):
     G = record.nx_graph
 
     # ── Metrics ────────────────────────────────────────────
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Nodes (IPs)", record.metadata.get('num_nodes', '?'))
     col2.metric("Edges (Flows)", record.metadata.get('num_edges', '?'))
     col3.metric("Ground Truth", record.ground_truth_label)
-    col4.metric("Flows in Window", record.metadata.get('num_flows', '?'))
+    col4.metric("Model Prediction", record.predicted_label)
+    col5.metric("Flows in Window", record.metadata.get('num_flows', '?'))
 
     # ── Topology visualization ─────────────────────────────
     st.subheader("Network Topology")
